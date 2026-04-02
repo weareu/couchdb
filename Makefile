@@ -75,7 +75,7 @@ DESTDIR=
 
 # Rebar options
 apps=
-skip_deps=meck,mochiweb,triq,proper,snappy,ibrowse
+skip_deps=meck,mochiweb,triq,proper,ibrowse
 suites=
 tests=
 
@@ -143,13 +143,13 @@ endif
 # target: fauxton - Build Fauxton web UI
 fauxton: share/www
 
-
 .PHONY: escriptize
 # target: escriptize - Build CLI tools
 escriptize: couch
 	@$(REBAR) -r escriptize apps=weatherreport
 	@cp src/weatherreport/weatherreport bin/weatherreport
-
+	@$(REBAR) -r escriptize apps=couch_special_compact
+	@cp src/couch_special_compact/couch_special_compact bin/couch_special_compact
 
 ################################################################################
 # Testing
@@ -185,7 +185,6 @@ eunit: couch
             COUCHDB_VERSION=$(COUCHDB_VERSION) COUCHDB_GIT_SHA=$(COUCHDB_GIT_SHA) $(REBAR) -r eunit $(EUNIT_OPTS) apps=$$dir || exit 1; \
         done
 
-
 setup-eunit: export BUILDDIR = $(CURDIR)
 setup-eunit: export ERL_AFLAGS = -config $(CURDIR)/rel/files/eunit.config
 setup-eunit:
@@ -194,7 +193,7 @@ setup-eunit:
 just-eunit: export BUILDDIR = $(CURDIR)
 just-eunit: export ERL_AFLAGS = -config $(CURDIR)/rel/files/eunit.config
 just-eunit:
-	@$(REBAR) -r eunit $(EUNIT_OPTS)
+	@$(REBAR) -r eunit  $(EUNIT_OPTS)
 
 .PHONY: soak-eunit
 soak-eunit: export BUILDDIR = $(CURDIR)
@@ -420,6 +419,7 @@ release: all
 	@rm -rf rel/couchdb
 	@$(REBAR) generate # make full erlang release
 	@cp bin/weatherreport rel/couchdb/bin/weatherreport
+	@cp bin/couch_special_compact rel/couchdb/bin/couch_special_compact
 
 ifeq ($(with_spidermonkey), true)
 	@mkdir -p rel/couchdb/share/server
@@ -484,6 +484,7 @@ clean:
 	@rm -rf .rebar/
 	@rm -f bin/couchjs
 	@rm -f bin/weatherreport
+	@rm -f bin/couch_special_compact
 	@find src/*/ebin \
 	  -not -path 'src/cowlib/ebin/cowlib.app' \
 	  -not -path 'src/cowlib/ebin' \

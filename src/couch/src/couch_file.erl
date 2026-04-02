@@ -68,6 +68,7 @@ open(Filepath) ->
     open(Filepath, []).
 
 open(Filepath, Options) ->
+    
     case
         gen_server:start_link(
             couch_file,

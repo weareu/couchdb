@@ -16,6 +16,16 @@
     start/4
 ]).
 
+%% Exported for testing
+-export([
+    parse_iso8601_date/1,
+    is_older_than_days/2,
+    find_date_in_props/2,
+    sanitize_path_component/1,
+    get_retention_opts_from_ini/0,
+    is_extraction_enabled/1
+]).
+
 -include_lib("couch/include/couch_db.hrl").
 -include("couch_bt_engine.hrl").
 
@@ -323,7 +333,7 @@ copy_compact(#comp_st{} = CompSt) ->
             if
                 AccUncopiedSize2 >= BufferSize ->
                     NewSt2 = copy_docs(
-                        St, AccNewSt, lists:reverse([DocInfo | AccUncopied]), Retry
+                        St, AccNewSt, lists:reverse([DocInfo | AccUncopied]), Retry, DbName
                     ),
                     AccCopiedSize2 = AccCopiedSize + AccUncopiedSize2,
                     if
@@ -371,7 +381,7 @@ copy_compact(#comp_st{} = CompSt) ->
             [{start_key, NewUpdateSeq + 1}]
         ),
 
-    NewSt3 = copy_docs(St, NewSt2, lists:reverse(Uncopied), Retry),
+    NewSt3 = copy_docs(St, NewSt2, lists:reverse(Uncopied), Retry, DbName),
 
     ?COMP_EVENT(seq_done),
 
@@ -390,7 +400,7 @@ copy_compact(#comp_st{} = CompSt) ->
         new_st = NewSt6
     }.
 
-copy_docs(St, #st{} = NewSt, MixedInfos, Retry) ->
+copy_docs(St, #st{} = NewSt, MixedInfos, Retry, DbName) ->
     DocInfoIds = [Id || #doc_info{id = Id} <- MixedInfos],
     LookupResults = couch_btree:lookup(St#st.id_tree, DocInfoIds),
     % COUCHDB-968, make sure we prune duplicates during compaction
@@ -401,12 +411,58 @@ copy_docs(St, #st{} = NewSt, MixedInfos, Retry) ->
         merge_lookups(MixedInfos, LookupResults)
     ),
 
+    ShortDbName = binary_to_list(mem3:dbname(DbName)),
+    RetentionOpts = get_retention_opts(ShortDbName),
+
+    % Filter out documents that exceed retention period (complete removal).
+    % NOTE: This reads document bodies to check date fields. Documents that
+    % pass the filter will have their bodies read again during copy. This
+    % double-read only occurs when remove_after_days > 0 and only for docs
+    % that are NOT removed (removed docs skip the second read entirely).
+    {NewInfos0b, _RemovedCount} = case RetentionOpts of
+        #{remove_after_days := RemoveDays} when RemoveDays > 0 ->
+            #{date_fields := DateFields} = RetentionOpts,
+            lists:foldl(
+                fun(Info, {Kept, Removed}) ->
+                    DocId = Info#full_doc_info.id,
+                    case should_remove_doc(St, Info, DateFields, RemoveDays) of
+                        true ->
+                            log_retained_removal(ShortDbName, DocId),
+                            {Kept, Removed + 1};
+                        false ->
+                            {[Info | Kept], Removed}
+                    end
+                end,
+                {[], 0},
+                NewInfos0
+            );
+        _ ->
+            {NewInfos0, 0}
+    end,
+    NewInfos0c = lists:reverse(NewInfos0b),
+
+    ExtractEnabled = is_extraction_enabled(ShortDbName),
+    ExtractAfterDays = case RetentionOpts of
+        #{extract_after_days := EAD} -> EAD;
+        _ -> 365
+    end,
     NewInfos1 = lists:map(
         fun(Info) ->
+            DocId = Info#full_doc_info.id,
             {NewRevTree, FinalAcc} = couch_key_tree:mapfold(
                 fun
                     ({RevPos, RevId}, #leaf{ptr = Sp} = Leaf, leaf, SizesAcc) ->
-                        {Body, AttInfos} = copy_doc_attachments(St, Sp, NewSt),
+                        {Body, AttInfos, ExtractedAttSize} =
+                            case ExtractEnabled of
+                                true ->
+                                    copy_doc_attachments_extract(
+                                        St, Sp, NewSt, DocId, DbName,
+                                        RetentionOpts, ExtractAfterDays
+                                    );
+                                false ->
+                                    {B, A} = copy_doc_attachments(St, Sp, NewSt),
+                                    {B, A, 0}
+                            end,
                         #size_info{external = OldExternalSize} = Leaf#leaf.sizes,
                         ExternalSize =
                             case OldExternalSize of
@@ -428,11 +484,14 @@ copy_docs(St, #st{} = NewSt, MixedInfos, Retry) ->
                         {ok, Doc2, ActiveSize} =
                             couch_bt_engine:write_doc_body(NewSt, Doc1),
                         AttSizes = [{element(3, A), element(4, A)} || A <- AttInfos],
+                        % Include extracted attachment size in active size
+                        % calculation to prevent smoosh from seeing a false
+                        % file/active ratio and triggering compaction loops
                         NewLeaf = Leaf#leaf{
                             ptr = Doc2#doc.body,
                             sizes = #size_info{
-                                active = ActiveSize,
-                                external = ExternalSize
+                                active = ActiveSize + ExtractedAttSize,
+                                external = ExternalSize + ExtractedAttSize
                             },
                             atts = AttSizes
                         },
@@ -456,7 +515,7 @@ copy_docs(St, #st{} = NewSt, MixedInfos, Retry) ->
                 }
             }
         end,
-        NewInfos0
+        NewInfos0c
     ),
 
     Limit = couch_bt_engine:get_revs_limit(St),
@@ -551,6 +610,393 @@ copy_doc_attachments(#st{} = SrcSt, SrcSp, DstSt) ->
         BinInfos
     ),
     {BodyData, NewBinInfos}.
+
+%% -------------------------------------------------------------------
+%% Attachment extraction: writes attachments to external storage
+%% (e.g. GlusterFS) during compaction based on document age.
+%% Returns {BodyData, AttInfos, ExtractedAttSize} where
+%% ExtractedAttSize is the total bytes of extracted attachments
+%% (used to keep active_size accurate and prevent smoosh loops).
+%% -------------------------------------------------------------------
+copy_doc_attachments_extract(#st{} = SrcSt, SrcSp, DstSt, DocId, DbName,
+                             RetentionOpts, ExtractAfterDays) ->
+    {ok, {BodyData0, BinInfos0}} = couch_file:pread_term(SrcSt#st.fd, SrcSp),
+    BinInfos =
+        case BinInfos0 of
+            _ when is_binary(BinInfos0) ->
+                couch_compress:decompress(BinInfos0);
+            _ when is_list(BinInfos0) ->
+                BinInfos0
+        end,
+    {BodyData, _WasCompressed} =
+        case BodyData0 of
+            _ when is_binary(BodyData0) ->
+                {couch_compress:decompress(BodyData0), true};
+            _ when is_list(BodyData0) ->
+                {BodyData0, false}
+        end,
+
+    DateFields = case RetentionOpts of
+        #{date_fields := DF} -> DF;
+        _ -> [<<"date">>]
+    end,
+    ShouldExtract = case BodyData of
+        {Props} when is_list(Props) ->
+            case find_date_in_props(Props, DateFields) of
+                undefined ->
+                    % No date field found — extract by default (old/unknown data)
+                    true;
+                {ok, DateTuple} ->
+                    is_older_than_days(DateTuple, ExtractAfterDays)
+            end;
+        _ ->
+            % Non-JSON body (raw binary, etc.) — don't extract
+            false
+    end,
+
+    case ShouldExtract andalso BinInfos =/= [] of
+        true ->
+            % Calculate total attachment size before extraction
+            TotalExtractedSize = lists:foldl(
+                fun(Att, Acc) -> Acc + att_disk_len(Att) end,
+                0,
+                BinInfos
+            ),
+            % Write each attachment to external storage
+            lists:foreach(
+                fun(Attachment) ->
+                    write_attachment_to_file(SrcSt, DocId, Attachment, DbName)
+                end,
+                BinInfos
+            ),
+            couch_log:info(
+                "Extracted ~B attachments (~B bytes) from ~s/~s to external storage",
+                [length(BinInfos), TotalExtractedSize,
+                 mem3:dbname(DbName), DocId]
+            ),
+            % Return original body, empty atts, and extracted size for
+            % size tracking (prevents smoosh from seeing false ratio)
+            {BodyData0, [], TotalExtractedSize};
+        false ->
+            % Keep attachments in database — standard copy
+            NewBinInfos = copy_bin_infos(SrcSt, DstSt, BinInfos),
+            {BodyData, NewBinInfos, 0}
+    end.
+
+%% -------------------------------------------------------------------
+%% Retention: determine if a document should be removed entirely
+%% during compaction (skipped from the new file).
+%% -------------------------------------------------------------------
+should_remove_doc(St, #full_doc_info{} = Info, DateFields, RemoveDays) ->
+    % Don't remove design docs or local docs
+    case Info#full_doc_info.id of
+        <<"_design/", _/binary>> -> false;
+        <<"_local/", _/binary>> -> false;
+        _ ->
+            % Don't remove already-deleted docs (they're tiny tombstones)
+            case Info#full_doc_info.deleted of
+                true -> false;
+                false ->
+                    % Read the winning revision body to check the date
+                    try
+                        WinSp = get_winning_leaf_ptr(Info#full_doc_info.rev_tree),
+                        case WinSp of
+                            undefined -> false;
+                            _ ->
+                                {ok, {BodyData0, _BinInfos}} =
+                                    couch_file:pread_term(St#st.fd, WinSp),
+                                BodyData = case BodyData0 of
+                                    _ when is_binary(BodyData0) ->
+                                        couch_compress:decompress(BodyData0);
+                                    _ -> BodyData0
+                                end,
+                                case BodyData of
+                                    {Props} when is_list(Props) ->
+                                        case find_date_in_props(Props, DateFields) of
+                                            undefined -> false;
+                                            {ok, DateTuple} ->
+                                                is_older_than_days(DateTuple, RemoveDays)
+                                        end;
+                                    _ ->
+                                        false
+                                end
+                        end
+                    catch
+                        _:_ -> false
+                    end
+            end
+    end.
+
+get_winning_leaf_ptr(RevTree) ->
+    try
+        FoldFun = fun
+            ({_RevPos, _RevId}, #leaf{ptr = Sp} = _Leaf, leaf, _Acc) ->
+                throw({found, Sp});
+            (_Rev, _Leaf, branch, Acc) ->
+                Acc
+        end,
+        couch_key_tree:mapfold(FoldFun, undefined, RevTree),
+        undefined
+    catch
+        throw:{found, Sp} -> Sp
+    end.
+
+%% -------------------------------------------------------------------
+%% Log removed document IDs to a retention log file and couch_log
+%% -------------------------------------------------------------------
+log_retained_removal(DbName, DocId) ->
+    couch_log:warning(
+        "Retention removal: db=~s doc_id=~s removed during compaction",
+        [DbName, DocId]
+    ),
+    LogDir = config:get("compaction_retention", "log_dir",
+        filename:join(config:get("couchdb", "database_dir", "/tmp/"),
+                      "retention_logs")),
+    LogFile = filename:join(LogDir, DbName ++ ".removal.log"),
+    ok = filelib:ensure_dir(LogFile),
+    {{Y, M, D}, {H, Mi, S}} = calendar:universal_time(),
+    Timestamp = io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ",
+        [Y, M, D, H, Mi, S]),
+    Line = io_lib:format("~s ~s~n", [Timestamp, DocId]),
+    case file:write_file(LogFile, Line, [append]) of
+        ok -> ok;
+        {error, Reason} ->
+            couch_log:error(
+                "Failed to write retention log ~s: ~p (doc_id=~s)",
+                [LogFile, Reason, DocId]
+            ),
+            throw({retention_log_write_failed, LogFile, Reason})
+    end.
+
+%% -------------------------------------------------------------------
+%% Date parsing and comparison utilities
+%% -------------------------------------------------------------------
+find_date_in_props(_Props, []) ->
+    undefined;
+find_date_in_props(Props, [Field | Rest]) ->
+    case lists:keyfind(Field, 1, Props) of
+        {_, DateString} when is_binary(DateString) ->
+            case parse_iso8601_date(DateString) of
+                {ok, DateTuple} -> {ok, DateTuple};
+                {error, _} -> find_date_in_props(Props, Rest)
+            end;
+        _ ->
+            find_date_in_props(Props, Rest)
+    end.
+
+is_older_than_days({Year, Month, Day}, Days) ->
+    {{CurY, CurM, CurD}, _} = calendar:universal_time(),
+    CutoffDays = calendar:date_to_gregorian_days({CurY, CurM, CurD}) - Days,
+    DocDays = calendar:date_to_gregorian_days({Year, Month, Day}),
+    DocDays < CutoffDays.
+
+parse_iso8601_date(DateString) ->
+    case binary:split(DateString, <<"T">>, [global]) of
+        [DatePart | _] ->
+            parse_date_part(DatePart);
+        _ ->
+            % Try without time component (just YYYY-MM-DD)
+            parse_date_part(DateString)
+    end.
+
+parse_date_part(DatePart) ->
+    case binary:split(DatePart, <<"-">>, [global]) of
+        [YearBin, MonthBin, DayBin] ->
+            try
+                Y = binary_to_integer(YearBin),
+                M = binary_to_integer(MonthBin),
+                D = binary_to_integer(DayBin),
+                case calendar:valid_date(Y, M, D) of
+                    true -> {ok, {Y, M, D}};
+                    false -> {error, invalid_date}
+                end
+            catch
+                _:_ -> {error, invalid_format}
+            end;
+        _ ->
+            {error, invalid_format}
+    end.
+
+%% -------------------------------------------------------------------
+%% Attachment file I/O
+%% -------------------------------------------------------------------
+write_attachment_to_file(SrcSt, DocId, Attachment, DbName) ->
+    {Name, DiskTerm} = case Attachment of
+        {N, _Type, _BinSp, _AttLen, _RevPos, _ExpectedMd5} = T ->
+            {N, T};
+        {N, _Type, _BinSp, _AttLen, _DiskLen, _RevPos, _ExpectedMd5, _Enc} = T ->
+            {N, T}
+    end,
+    ShortDbName = binary_to_list(mem3:dbname(DbName)),
+    AttachmentPath = get_attachment_path(DocId, Name, ShortDbName),
+    ok = filelib:ensure_dir(AttachmentPath),
+    StreamSrc = fun(Sp) -> couch_bt_engine:open_read_stream(SrcSt, Sp) end,
+    AttachmentObj = couch_att:from_disk_term(StreamSrc, DiskTerm),
+    BinaryData = couch_att:to_binary(AttachmentObj),
+    ok = file:write_file(AttachmentPath, BinaryData),
+    ExpectedMd5 = couch_att:fetch(md5, AttachmentObj),
+    ActualMd5 = erlang:md5(BinaryData),
+    case ActualMd5 =:= ExpectedMd5 of
+        true -> ok;
+        false -> throw({checksum_mismatch, DocId, Name, {ExpectedMd5, ActualMd5}})
+    end.
+
+get_attachment_path(DocId, AttachmentName, DbName) ->
+    DataDir = config:get("couchdb", "database_dir", "/tmp/"),
+    SafeDocId = sanitize_path_component(DocId),
+    SafeAttName = sanitize_path_component(AttachmentName),
+    SafeDbName = sanitize_path_component(DbName),
+    filename:join([DataDir, "attachments", SafeDbName, SafeDocId, SafeAttName]).
+
+sanitize_path_component(Bin) when is_binary(Bin) ->
+    sanitize_path_component(binary_to_list(Bin));
+sanitize_path_component(Str) when is_list(Str) ->
+    % Reject path traversal: replace "..", "/", "\", and control chars
+    re:replace(Str, "(\\.\\.|[/\\\\[:cntrl:]])", "_",
+               [global, {return, list}]).
+
+att_disk_len({_Name, _Type, _BinSp, AttLen, _RevPos, _Md5}) ->
+    AttLen;
+att_disk_len({_Name, _Type, _BinSp, _AttLen, DiskLen, _RevPos, _Md5, _Enc}) ->
+    DiskLen.
+
+copy_bin_infos(SrcSt, DstSt, BinInfos) ->
+    lists:map(
+        fun
+            ({Name, Type, BinSp, AttLen, RevPos, ExpectedMd5}) ->
+                {ok, SrcStream} = couch_bt_engine:open_read_stream(SrcSt, BinSp),
+                {ok, DstStream} = couch_bt_engine:open_write_stream(DstSt, []),
+                ok = couch_stream:copy(SrcStream, DstStream),
+                {NewStream, AttLen, AttLen, ActualMd5, _IdentityMd5} =
+                    couch_stream:close(DstStream),
+                {ok, NewBinSp} = couch_stream:to_disk_term(NewStream),
+                couch_util:check_md5(ExpectedMd5, ActualMd5),
+                {Name, Type, NewBinSp, AttLen, AttLen, RevPos, ExpectedMd5, identity};
+            ({Name, Type, BinSp, AttLen, DiskLen, RevPos, ExpectedMd5, Enc1}) ->
+                {ok, SrcStream} = couch_bt_engine:open_read_stream(SrcSt, BinSp),
+                {ok, DstStream} = couch_bt_engine:open_write_stream(DstSt, []),
+                ok = couch_stream:copy(SrcStream, DstStream),
+                {NewStream, AttLen, _, ActualMd5, _IdentityMd5} =
+                    couch_stream:close(DstStream),
+                {ok, NewBinSp} = couch_stream:to_disk_term(NewStream),
+                couch_util:check_md5(ExpectedMd5, ActualMd5),
+                Enc = case Enc1 of
+                    true -> gzip;
+                    false -> identity;
+                    _ -> Enc1
+                end,
+                {Name, Type, NewBinSp, AttLen, DiskLen, RevPos, ExpectedMd5, Enc}
+        end,
+        BinInfos
+    ).
+
+%% -------------------------------------------------------------------
+%% Configuration: reads retention/extraction settings.
+%% INI points to a design doc name; the design doc is replicated
+%% across all nodes automatically, ensuring cluster-wide consistency.
+%%
+%% INI config:
+%%   [compaction_retention]
+%%   config_ddoc = _design/retention_config
+%%   log_dir = /var/lib/couchdb/retention_logs
+%%
+%% Design doc structure (per-database, replicated):
+%%   {
+%%     "_id": "_design/retention_config",
+%%     "retention": {
+%%       "date_fields": ["date", "created_at"],
+%%       "extract_after_days": 365,
+%%       "remove_after_days": 730
+%%     }
+%%   }
+%%
+%% If no design doc exists, falls back to INI-only config:
+%%   [compaction_retention]
+%%   date_fields = date,created_at
+%%   extract_after_days = 365
+%%   remove_after_days = 0
+%% -------------------------------------------------------------------
+get_retention_opts(ShortDbName) ->
+    DDocId = config:get("compaction_retention", "config_ddoc", ""),
+    case DDocId of
+        "" ->
+            get_retention_opts_from_ini();
+        _ ->
+            case get_retention_opts_from_ddoc(ShortDbName, DDocId) of
+                {ok, Opts} -> Opts;
+                {error, _} -> get_retention_opts_from_ini()
+            end
+    end.
+
+get_retention_opts_from_ini() ->
+    DateFieldsRaw = config:get("compaction_retention", "date_fields", "date"),
+    DateFields = [list_to_binary(string:trim(F))
+                  || F <- string:split(DateFieldsRaw, ",", all),
+                     string:trim(F) =/= ""],
+    ExtractDays = couch_util:to_integer(
+        config:get("compaction_retention", "extract_after_days", "365")),
+    RemoveDays = couch_util:to_integer(
+        config:get("compaction_retention", "remove_after_days", "0")),
+    #{
+        date_fields => DateFields,
+        extract_after_days => ExtractDays,
+        remove_after_days => RemoveDays
+    }.
+
+get_retention_opts_from_ddoc(DbName, DDocId) ->
+    try
+        DDocIdBin = list_to_binary(DDocId),
+        couch_util:with_db(list_to_binary(DbName), fun(Db) ->
+            case couch_db:open_doc(Db, DDocIdBin, [ejson_body]) of
+                {ok, #doc{body = {DocProps}}} ->
+                    case lists:keyfind(<<"retention">>, 1, DocProps) of
+                        {_, {RetentionProps}} ->
+                            DateFields = case lists:keyfind(<<"date_fields">>, 1, RetentionProps) of
+                                {_, Fields} when is_list(Fields) -> Fields;
+                                _ -> [<<"date">>]
+                            end,
+                            ExtractDays = case lists:keyfind(<<"extract_after_days">>, 1, RetentionProps) of
+                                {_, ED} when is_integer(ED) -> ED;
+                                _ -> 365
+                            end,
+                            RemoveDays = case lists:keyfind(<<"remove_after_days">>, 1, RetentionProps) of
+                                {_, RD} when is_integer(RD) -> RD;
+                                _ -> 0
+                            end,
+                            {ok, #{
+                                date_fields => DateFields,
+                                extract_after_days => ExtractDays,
+                                remove_after_days => RemoveDays
+                            }};
+                        _ ->
+                            {error, no_retention_field}
+                    end;
+                {not_found, _} ->
+                    {error, ddoc_not_found}
+            end
+        end)
+    catch
+        _:Reason ->
+            couch_log:warning(
+                "Failed to read retention config from ~s: ~p",
+                [DDocId, Reason]
+            ),
+            {error, Reason}
+    end.
+
+is_extraction_enabled(ShortDbName) ->
+    case config:get("compaction_retention", "extract_enabled", "false") of
+        "true" ->
+            % Check if specific databases are listed, or all
+            case config:get("compaction_retention", "extract_databases", "all") of
+                "all" -> true;
+                DbList ->
+                    Dbs = [string:trim(D) || D <- string:split(DbList, ",", all)],
+                    lists:member(ShortDbName, Dbs)
+            end;
+        _ ->
+            false
+    end.
 
 sort_meta_data(#comp_st{new_st = St0} = CompSt) ->
     ?COMP_EVENT(md_sort_init),

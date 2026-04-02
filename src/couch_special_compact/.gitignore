@@ -1,0 +1,13 @@
+doc/
+deps/
+ebin/*
+log/
+edoc/
+index.html
+couch_special_compact
+*.png
+pkg/
+erl_crash.dump
+.eunit/
+*~
+#*#
