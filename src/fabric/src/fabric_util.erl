@@ -26,6 +26,7 @@
     doc_id_and_rev/1
 ]).
 -export([request_timeout/0, attachments_timeout/0, all_docs_timeout/0, view_timeout/1, timeout/2]).
+-export([cross_zone_timeout/1]).
 -export([abs_request_timeout/0]).
 -export([log_timeout/2, remove_done_workers/2]).
 -export([is_users_db/1, is_replicator_db/1]).
@@ -97,6 +98,22 @@ timeout(Type, Default) ->
         "infinity" -> infinity;
         N -> list_to_integer(N)
     end.
+
+%% Returns a timeout adjusted for cross-zone communication.
+%% For same-zone nodes, returns the base timeout.
+%% For cross-zone nodes, multiplies by cross_zone_timeout_factor.
+%% This prevents slow remote DCs from blocking local operations
+%% while giving cross-DC replication enough time to complete.
+%%
+%% Config:
+%%   [cluster]
+%%   cross_zone_timeout_factor = 3
+%%
+cross_zone_timeout(BaseTimeout) when BaseTimeout =:= infinity ->
+    infinity;
+cross_zone_timeout(BaseTimeout) ->
+    Factor = config:get_integer("cluster", "cross_zone_timeout_factor", 3),
+    BaseTimeout * max(1, Factor).
 
 log_timeout(Workers, EndPoint) ->
     CounterKey = [fabric, worker, timeouts],

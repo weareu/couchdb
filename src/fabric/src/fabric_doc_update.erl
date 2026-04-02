@@ -111,7 +111,9 @@ handle_message({ok, Replies}, Worker, #acc{} = Acc0) ->
             ),
             {stop, {Health, Reply}};
         {_, DocCount} ->
-            % we've got at least one reply for each document, let's take a look
+            % We've got at least one reply for each document.
+            % Check quorum eagerly — don't wait for slow cross-zone
+            % replicas if we already have W successful replies.
             case dict:fold(fun maybe_reply/3, {stop, W, []}, DocReplyDict) of
                 continue ->
                     {ok, Acc0#acc{
@@ -123,9 +125,20 @@ handle_message({ok, Replies}, Worker, #acc{} = Acc0) ->
                     {stop, {ok, FinalReplies}}
             end;
         _ ->
-            {ok, Acc0#acc{
-                waiting_count = WaitingCount - 1, grouped_docs = NewGrpDocs, reply = DocReplyDict
-            }}
+            % Not all docs have a reply yet, but check if the docs that
+            % DO have replies already meet quorum. This enables early
+            % return when same-zone replicas respond before cross-zone
+            % ones, critical for multi-DC deployments.
+            case try_early_quorum(DocReplyDict, DocCount, W) of
+                {ok, FinalReplies} ->
+                    {stop, {ok, FinalReplies}};
+                continue ->
+                    {ok, Acc0#acc{
+                        waiting_count = WaitingCount - 1,
+                        grouped_docs = NewGrpDocs,
+                        reply = DocReplyDict
+                    }}
+            end
     end;
 handle_message({missing_stub, Stub}, _, _) ->
     throw({missing_stub, Stub});
@@ -324,6 +337,24 @@ append_update_replies([Doc | Rest], [], Dict0) ->
     append_update_replies(Rest, [], dict:append(Doc, noreply, Dict0));
 append_update_replies([Doc | Rest1], [Reply | Rest2], Dict0) ->
     append_update_replies(Rest1, Rest2, dict:append(Doc, Reply, Dict0)).
+
+%% Check if ALL documents already have quorum met, even if not all
+%% workers have responded yet. This enables early return when fast
+%% same-zone replicas have already satisfied W for every document,
+%% without waiting for slow cross-zone replicas.
+try_early_quorum(DocReplyDict, DocCount, W) ->
+    case dict:size(DocReplyDict) < DocCount of
+        true ->
+            % Not all docs have any reply yet — can't return early
+            continue;
+        false ->
+            case dict:fold(fun maybe_reply/3, {stop, W, []}, DocReplyDict) of
+                {stop, W, FinalReplies} ->
+                    {ok, FinalReplies};
+                continue ->
+                    continue
+            end
+    end.
 
 skip_message(#acc{waiting_count = 0, w = W, reply = DocReplyDict}) ->
     {Health, W, Reply} = dict:fold(fun force_reply/3, {ok, W, []}, DocReplyDict),
