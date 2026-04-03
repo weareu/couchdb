@@ -73,10 +73,12 @@ go(DbName, AllDocs0, Opts) ->
 
 handle_message({rexi_DOWN, _, {_, NodeRef}, _}, _Worker, #acc{} = Acc0) ->
     #acc{grouped_docs = GroupedDocs} = Acc0,
+    mem3_circuit_breaker:record_failure(NodeRef),
     NewGrpDocs = [X || {#shard{node = N}, _} = X <- GroupedDocs, N =/= NodeRef],
     skip_message(Acc0#acc{waiting_count = length(NewGrpDocs), grouped_docs = NewGrpDocs});
 handle_message({rexi_EXIT, _}, Worker, #acc{} = Acc0) ->
     #acc{waiting_count = WC, grouped_docs = GrpDocs} = Acc0,
+    mem3_circuit_breaker:record_failure(Worker#shard.node),
     NewGrpDocs = lists:keydelete(Worker, 1, GrpDocs),
     skip_message(Acc0#acc{waiting_count = WC - 1, grouped_docs = NewGrpDocs});
 handle_message({error, all_dbs_active}, Worker, #acc{} = Acc0) ->
@@ -92,6 +94,7 @@ handle_message(internal_server_error, Worker, #acc{} = Acc0) ->
 handle_message(attachment_chunk_received, _Worker, #acc{} = Acc0) ->
     {ok, Acc0};
 handle_message({ok, Replies}, Worker, #acc{} = Acc0) ->
+    mem3_circuit_breaker:record_success(Worker#shard.node),
     #acc{
         waiting_count = WaitingCount,
         doc_count = DocCount,
