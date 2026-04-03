@@ -61,14 +61,6 @@ cpse_compact_local_doc(Db1) ->
     Diff = cpse_util:term_diff(Term1, Term2),
     ?assertEqual(nodiff, Diff).
 
-% Helper function to format date as ISO 8601 string
-format_date({Date, Time}) ->
-    {{Year, Month, Day}, {Hour, Minute, Second}} = {Date, Time},
-    iolist_to_binary(
-        io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ",
-            [Year, Month, Day, Hour, Minute, Second])
-    ).
-
 cpse_compact_with_everything(Db1) ->
     % Add a whole bunch of docs
     DocActions = lists:map(

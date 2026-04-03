@@ -543,15 +543,19 @@ copy_docs(St, #st{} = NewSt, MixedInfos, Retry) ->
         {BodyData3, []}.
 
     write_attachment_to_file(SrcSt, DocId, Attachment) ->
-        {Name, _Type, BinSp, _AttLen, _RevPos, _ExpectedMd5} = Attachment,
+        {Name, BinSp} = case Attachment of
+            {N, _Type, Sp, _AttLen, _RevPos, _ExpectedMd5} ->
+                {N, Sp};
+            {N, _Type, Sp, _AttLen, _DiskLen, _RevPos, _ExpectedMd5, _Enc} ->
+                {N, Sp}
+        end,
         AttachmentPath = get_attachment_path(DocId, Name),
-        % Ensure the directory exists
+        TmpPath = AttachmentPath ++ ".tmp",
         ok = filelib:ensure_dir(AttachmentPath),
-        % Read attachment data from the source database
         {ok, SrcStream} = couch_bt_engine:open_read_stream(SrcSt, BinSp),
         {ok, AttachmentData} = read_stream_to_binary(SrcStream),
-        % Write attachment data to file
-        ok = file:write_file(AttachmentPath, AttachmentData),
+        ok = file:write_file(TmpPath, AttachmentData),
+        ok = file:rename(TmpPath, AttachmentPath),
         ok.
 
     get_data_dir() ->
@@ -559,7 +563,15 @@ copy_docs(St, #st{} = NewSt, MixedInfos, Retry) ->
     
     get_attachment_path(DocId, AttachmentName) ->
         DataDir = get_data_dir(),
-        filename:join([DataDir, "attachments", DocId, AttachmentName]).
+        SafeDocId = sanitize_path_component(DocId),
+        SafeAttName = sanitize_path_component(AttachmentName),
+        filename:join([DataDir, "attachments", SafeDocId, SafeAttName]).
+
+    sanitize_path_component(Bin) when is_binary(Bin) ->
+        sanitize_path_component(binary_to_list(Bin));
+    sanitize_path_component(Str) when is_list(Str) ->
+        re:replace(Str, "(\\.\\.|[/\\\\[:cntrl:]])", "_",
+                   [global, {return, list}]).
 
     read_stream_to_binary(Stream) ->
         read_stream_to_binary(Stream, []).

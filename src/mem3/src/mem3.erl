@@ -461,8 +461,16 @@ ping_nodes() ->
         fun(N) -> node_info(N, <<"zone">>) =:= LocalZone end,
         Nodes
     ),
-    SameResults = ping_nodes(SameZoneNodes, SameZoneTimeout),
-    CrossResults = ping_nodes(CrossZoneNodes, CrossZoneTimeout),
+    % Run both zone pings in parallel to avoid sequential delay
+    Self = self(),
+    SameRef = make_ref(),
+    CrossRef = make_ref(),
+    spawn_link(fun() -> Self ! {SameRef, ping_nodes(SameZoneNodes, SameZoneTimeout)} end),
+    spawn_link(fun() -> Self ! {CrossRef, ping_nodes(CrossZoneNodes, CrossZoneTimeout)} end),
+    SameResults = receive {SameRef, R1} -> R1
+                  after SameZoneTimeout + 1000 -> [] end,
+    CrossResults = receive {CrossRef, R2} -> R2
+                   after CrossZoneTimeout + 1000 -> [] end,
     lists:sort(SameResults ++ CrossResults).
 
 -spec ping_nodes(Timeout :: pos_integer()) -> [{node(), pos_integer() | Error :: term()}].
