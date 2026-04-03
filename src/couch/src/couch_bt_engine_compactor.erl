@@ -34,7 +34,9 @@
     old_st,
     new_st,
     meta_fd,
-    retry
+    retry,
+    retention_opts,
+    extract_enabled
 }).
 
 -record(comp_header, {
@@ -325,8 +327,6 @@ copy_compact(#comp_st{} = CompSt) ->
     ShortDbName = binary_to_list(mem3:dbname(DbName)),
     RetentionOpts = get_retention_opts(ShortDbName),
     ExtractEnabled = is_extraction_enabled(ShortDbName),
-    erlang:put(compaction_retention_opts, RetentionOpts),
-    erlang:put(compaction_extract_enabled, ExtractEnabled),
     BufferSize = list_to_integer(
         config:get("database_compaction", "doc_buffer_size", "524288")
     ),
@@ -354,7 +354,8 @@ copy_compact(#comp_st{} = CompSt) ->
             if
                 AccUncopiedSize2 >= BufferSize ->
                     NewSt2 = copy_docs(
-                        St, AccNewSt, lists:reverse([DocInfo | AccUncopied]), Retry, DbName
+                        St, AccNewSt, lists:reverse([DocInfo | AccUncopied]),
+                        Retry, DbName, RetentionOpts, ExtractEnabled
                     ),
                     AccCopiedSize2 = AccCopiedSize + AccUncopiedSize2,
                     if
@@ -402,7 +403,8 @@ copy_compact(#comp_st{} = CompSt) ->
             [{start_key, NewUpdateSeq + 1}]
         ),
 
-    NewSt3 = copy_docs(St, NewSt2, lists:reverse(Uncopied), Retry, DbName),
+    NewSt3 = copy_docs(St, NewSt2, lists:reverse(Uncopied), Retry, DbName,
+                       RetentionOpts, ExtractEnabled),
 
     ?COMP_EVENT(seq_done),
 
@@ -421,7 +423,8 @@ copy_compact(#comp_st{} = CompSt) ->
         new_st = NewSt6
     }.
 
-copy_docs(St, #st{} = NewSt, MixedInfos, Retry, DbName) ->
+copy_docs(St, #st{} = NewSt, MixedInfos, Retry, DbName,
+          RetentionOpts, ExtractEnabled) ->
     DocInfoIds = [Id || #doc_info{id = Id} <- MixedInfos],
     LookupResults = couch_btree:lookup(St#st.id_tree, DocInfoIds),
     % COUCHDB-968, make sure we prune duplicates during compaction
@@ -432,10 +435,7 @@ copy_docs(St, #st{} = NewSt, MixedInfos, Retry, DbName) ->
         merge_lookups(MixedInfos, LookupResults)
     ),
 
-    % Use config cached at compaction start (copy_compact) to avoid
-    % inconsistent behavior if config changes mid-compaction.
     ShortDbName = binary_to_list(mem3:dbname(DbName)),
-    RetentionOpts = erlang:get(compaction_retention_opts),
 
     % SPEED: Batch retention date check using a single pread_terms call
     % for all doc bodies, instead of reading one-at-a-time in should_remove_doc.
@@ -448,7 +448,7 @@ copy_docs(St, #st{} = NewSt, MixedInfos, Retry, DbName) ->
             NewInfos0
     end,
 
-    ExtractEnabled = erlang:get(compaction_extract_enabled),
+    % RetentionOpts and ExtractEnabled passed from copy_compact
     ExtractAfterDays = case RetentionOpts of
         #{extract_after_days := EAD} -> EAD;
         _ -> 365

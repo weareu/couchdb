@@ -63,15 +63,13 @@ submit_jobs(Shards, EndPoint, ExtraArgs) ->
     submit_jobs(Shards, fabric_rpc, EndPoint, ExtraArgs).
 
 submit_jobs(Shards, Module, EndPoint, ExtraArgs) ->
-    lists:filtermap(
+    Filtered = lists:filtermap(
         fun(#shard{node = Node, name = ShardName} = Shard) ->
             case mem3_circuit_breaker:allow(Node) of
                 ok ->
                     Ref = rexi:cast(Node, {Module, EndPoint, [ShardName | ExtraArgs]}),
                     {true, Shard#shard{ref = Ref}};
                 {error, circuit_open} ->
-                    % Node is behind a broken cable or unreachable.
-                    % Skip it — let quorum be met by healthy replicas.
                     couch_log:debug(
                         "Circuit breaker: skipping ~s for ~s/~s",
                         [Node, Module, EndPoint]
@@ -80,7 +78,27 @@ submit_jobs(Shards, Module, EndPoint, ExtraArgs) ->
             end
         end,
         Shards
-    ).
+    ),
+    case Filtered of
+        [] when Shards =/= [] ->
+            % All shards filtered by circuit breaker — fall back to
+            % submitting to all shards anyway. Better to wait for a
+            % timeout than to guarantee immediate failure.
+            couch_log:warning(
+                "Circuit breaker: all ~B shards filtered for ~s/~s, "
+                "falling back to full submit",
+                [length(Shards), Module, EndPoint]
+            ),
+            lists:map(
+                fun(#shard{node = Node, name = ShardName} = Shard) ->
+                    Ref = rexi:cast(Node, {Module, EndPoint, [ShardName | ExtraArgs]}),
+                    Shard#shard{ref = Ref}
+                end,
+                Shards
+            );
+        _ ->
+            Filtered
+    end.
 
 cleanup(Workers) ->
     rexi:kill_all([{Node, Ref} || #shard{node = Node, ref = Ref} <- Workers]).

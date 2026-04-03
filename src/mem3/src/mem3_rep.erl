@@ -277,7 +277,6 @@ delete_checkpoint(Db, DocId) ->
             couch_log:error(ErrLog, [?MODULE, DbName, DocId, Tag, Error]),
             ok
     end.
->>>>>>> 0d2002dbc (Fix race condition during purge checkpoint creation)
 
 fold_purge_checkpoints(Db, FoldFun, Acc0) ->
     Opts = [{start_key, list_to_binary(?PURGE_PREFIX)}],
