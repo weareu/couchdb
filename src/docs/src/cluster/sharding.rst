@@ -890,3 +890,90 @@ rules automatically.
 Downtime can be avoided in production if the client application(s) can
 be instructed to use the new database instead of the old one, and a cut-
 over is performed during a very brief outage window.
+
+.. _cluster/sharding/auto_splitting:
+
+Automatic Shard Splitting
+-------------------------
+
+CouchDB can automatically split shards that exceed a configurable size
+threshold. This is particularly useful for large databases (100+ GB)
+where manual resharding is impractical and large shards cause slow
+compaction, massive index rebuilds, and replication bottlenecks.
+
+**How it works:**
+
+1. The auto-shard system periodically scans local shard sizes
+2. Shards exceeding ``max_shard_size_bytes`` (default 20 GB) are candidates
+3. A coordinator node (lowest lexicographic in the cluster) runs the scan
+4. Splits use internal replication (``mem3_rep``) to stream documents
+   directly to target shards on their destination nodes
+5. The source node does NOT need 2x free disk space
+6. Target placement is capacity-weighted (nodes with most free space preferred)
+7. After split, mandatory consistency verification runs before source deletion
+8. If verification fails, the source shard is NOT deleted
+
+**Enabling auto-splitting:**
+
+.. code-block:: ini
+
+    [auto_shard]
+    enabled = true
+    max_shard_size_bytes = 20000000000
+
+**Monitoring via HTTP API:**
+
+.. code-block:: bash
+
+    # Check status
+    $ curl -s $COUCH_URL:5984/_reshard/auto | jq .
+
+    # Trigger immediate scan
+    $ curl -X POST $COUCH_URL:5984/_reshard/auto/scan
+
+    # Pause auto-splitting
+    $ curl -X POST $COUCH_URL:5984/_reshard/auto/pause
+
+    # Resume auto-splitting
+    $ curl -X POST $COUCH_URL:5984/_reshard/auto/resume
+
+**Excluding databases:**
+
+Some databases should not be auto-split. Use the ``exclude_dbs``
+configuration or a per-database design document:
+
+.. code-block:: ini
+
+    [auto_shard]
+    exclude_dbs = _users,_replicator,metrics_*
+
+.. code-block:: json
+
+    {
+        "_id": "_design/shard_config",
+        "auto_split": {
+            "enabled": false,
+            "reason": "Custom retention policy"
+        }
+    }
+
+**Multi-directory storage:**
+
+Database files can be stored on different mount points using per-database
+path rules or automatic allocation:
+
+.. code-block:: ini
+
+    [database_paths]
+    important_db = /mnt/nvme1
+    archive_* = /mnt/hdd_array
+    shards/*/users.* = /mnt/ssd
+
+    [couchdb]
+    database_dirs = /data1,/data2,/data3
+
+When ``database_dirs`` is configured and no path rule matches, new
+databases are placed on the directory with the most free space.
+
+See :ref:`config/auto_shard` and :ref:`config/database_paths` for full
+configuration reference.

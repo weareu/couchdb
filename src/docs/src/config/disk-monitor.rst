@@ -74,3 +74,14 @@ Disk Monitor Options
 
             [disk_monitor]
             interactive_view_indexing_threshold = 90
+
+    The disk monitor also provides a per-directory capacity API used by the
+    auto-shard system for capacity-weighted shard placement. When
+    ``database_dirs`` is configured in the ``[couchdb]`` section, the
+    disk monitor tracks free space on each directory independently.
+
+    The ``dir_capacities/0`` function returns
+    ``[{Path, PercentUsed, FreeBytes, TotalBytes}]`` for all configured
+    database directories. The ``least_used_dir/0`` function returns the
+    directory with the most free space, used when allocating new database
+    files.
