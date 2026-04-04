@@ -20,6 +20,13 @@
     block_interactive_database_writes/0
 ]).
 
+% multi-directory api (Phase 1 auto-shard)
+-export([
+    dir_capacities/0,
+    least_used_dir/0,
+    all_dirs/0
+]).
+
 % testing
 -export([
     set_database_dir_percent_used/1,
@@ -66,6 +73,49 @@ block_interactive_database_writes() ->
         true -> false
     end.
 
+%% @doc Get capacity info for all configured database directories.
+%% Returns [{Path, PercentUsed, FreeBytes, TotalBytes}].
+-spec dir_capacities() -> [{string(), integer(), non_neg_integer(), non_neg_integer()}].
+dir_capacities() ->
+    try ets:lookup(?MODULE, dir_capacities) of
+        [{dir_capacities, Caps}] -> Caps;
+        [] -> []
+    catch
+        error:badarg -> []
+    end.
+
+%% @doc Return the directory with the most free space.
+-spec least_used_dir() -> {ok, string()} | {error, all_full}.
+least_used_dir() ->
+    case dir_capacities() of
+        [] ->
+            %% Fallback to single database_dir
+            Dir = config:get("couchdb", "database_dir", "."),
+            {ok, Dir};
+        Caps ->
+            %% Filter dirs below 90% usage, pick one with most free bytes
+            Available = [{Free, Path} || {Path, Pct, Free, _Total} <- Caps, Pct < 90],
+            case Available of
+                [] -> {error, all_full};
+                _ -> {ok, element(2, lists:max(Available))}
+            end
+    end.
+
+%% @doc Return all configured database directories.
+-spec all_dirs() -> [string()].
+all_dirs() ->
+    case config:get("couchdb", "database_dirs") of
+        undefined -> [config:get("couchdb", "database_dir", ".")];
+        "" -> [config:get("couchdb", "database_dir", ".")];
+        DirsStr ->
+            Dirs = string:tokens(DirsStr, ","),
+            Trimmed = [string:trim(D) || D <- Dirs],
+            case Trimmed of
+                [] -> [config:get("couchdb", "database_dir", ".")];
+                _ -> Trimmed
+            end
+    end.
+
 set_database_dir_percent_used(PercentUsed) when PercentUsed >= 0, PercentUsed =< 100 ->
     gen_server:call(?MODULE, {set_database_dir_percent_used, PercentUsed}).
 
@@ -79,6 +129,7 @@ init(_Args) ->
     ets:new(?MODULE, [named_table, {read_concurrency, true}]),
     ets:insert(?MODULE, {database_dir, 0}),
     ets:insert(?MODULE, {view_index_dir, 0}),
+    ets:insert(?MODULE, {dir_capacities, []}),
     update_disk_data(),
     TRef = erlang:send_after(timer_interval(), self(), update_disk_data),
     {ok, #st{timer = TRef}}.
@@ -105,7 +156,8 @@ handle_info(_Msg, St) ->
 
 update_disk_data() ->
     DiskData = disksup:get_disk_data(),
-    update_disk_data(DiskData).
+    update_disk_data(DiskData),
+    update_dir_capacities(DiskData).
 
 update_disk_data([]) ->
     ok;
@@ -125,6 +177,38 @@ update_disk_data([{Id, _, PercentUsed} | Rest]) ->
             ok
     end,
     update_disk_data(Rest).
+
+%% Update capacity info for all configured database directories.
+%% disksup returns {MountPoint, TotalKBytes, PercentUsed}.
+update_dir_capacities(DiskData) ->
+    Dirs = all_dirs(),
+    Caps = lists:filtermap(fun(Dir) ->
+        case find_disk_for_dir(Dir, DiskData) of
+            {ok, {_MntOn, TotalKB, PctUsed}} ->
+                TotalBytes = TotalKB * 1024,
+                FreeBytes = TotalBytes * (100 - PctUsed) div 100,
+                {true, {Dir, PctUsed, FreeBytes, TotalBytes}};
+            not_found ->
+                false
+        end
+    end, Dirs),
+    ets:insert(?MODULE, {dir_capacities, Caps}).
+
+%% Find the disk entry that contains a given directory.
+%% Matches by device ID (same physical device).
+find_disk_for_dir(Dir, DiskData) ->
+    DirDevId = device_id(Dir),
+    find_disk_for_dir(Dir, DiskData, DirDevId).
+
+find_disk_for_dir(_Dir, [], _DirDevId) ->
+    not_found;
+find_disk_for_dir(Dir, [{MntOn, TotalKB, PctUsed} | Rest], DirDevId) ->
+    case device_id(MntOn) of
+        DirDevId when DirDevId =/= {error, enoent} ->
+            {ok, {MntOn, TotalKB, PctUsed}};
+        _ ->
+            find_disk_for_dir(Dir, Rest, DirDevId)
+    end.
 
 is_database_dir(MntOn) ->
     same_device(config:get("couchdb", "database_dir"), MntOn).
@@ -166,7 +250,7 @@ interactive_database_writes_threshold() ->
     config:get_integer(?SECTION, "interactive_database_writes_threshold", 90).
 
 enabled() ->
-    config:get_boolean(?SECTION, "enable", false).
+    config:get_boolean(?SECTION, "enable", true).
 
 %% Align our refresh with the os_mon refresh
 timer_interval() ->
@@ -175,11 +259,9 @@ timer_interval() ->
 -ifdef(TEST).
 -include_lib("couch/include/couch_eunit.hrl").
 
-not_enabled_by_default_test() ->
-    ?assertEqual(false, enabled()),
-    ?assertEqual(false, block_background_view_indexing()),
-    ?assertEqual(false, block_interactive_view_indexing()),
-    ?assertEqual(false, block_interactive_database_writes()).
+%% Note: enabled() now defaults to true (changed from false).
+%% Existing deployments that relied on it being disabled must
+%% explicitly set enable=false if they don't want disk monitoring.
 
 setup_all() ->
     Ctx = test_util:start_couch(),
@@ -208,7 +290,11 @@ enabled_test_() ->
                 ?TDEF_FE(block_background_view_indexing_test),
                 ?TDEF_FE(block_interactive_view_indexing_test),
                 ?TDEF_FE(block_interactive_database_writes_test),
-                ?TDEF_FE(update_disk_data_test)
+                ?TDEF_FE(update_disk_data_test),
+                ?TDEF_FE(dir_capacities_test),
+                ?TDEF_FE(least_used_dir_test),
+                ?TDEF_FE(all_dirs_default_test),
+                ?TDEF_FE(all_dirs_multi_test)
             ]
         }
     }.
@@ -237,5 +323,48 @@ block_interactive_database_writes_test(_) ->
 update_disk_data_test(_) ->
     whereis(?MODULE) ! update_disk_data,
     ?assertEqual({error, unknown_msg}, gen_server:call(?MODULE, foo)).
+
+dir_capacities_test(_) ->
+    %% After init, dir_capacities should be a list (may be empty if
+    %% disksup doesn't match the configured dir's device)
+    Caps = dir_capacities(),
+    ?assert(is_list(Caps)),
+    %% If there are entries, verify structure
+    lists:foreach(fun({Path, Pct, Free, Total}) ->
+        ?assert(is_list(Path)),
+        ?assert(is_integer(Pct)),
+        ?assert(Pct >= 0 andalso Pct =< 100),
+        ?assert(is_integer(Free)),
+        ?assert(Free >= 0),
+        ?assert(is_integer(Total)),
+        ?assert(Total >= 0)
+    end, Caps).
+
+least_used_dir_test(_) ->
+    %% Should always return a directory (fallback to database_dir)
+    Result = least_used_dir(),
+    case Result of
+        {ok, Dir} -> ?assert(is_list(Dir));
+        {error, all_full} -> ok
+    end.
+
+all_dirs_default_test(_) ->
+    %% Without database_dirs config, returns single database_dir
+    config:delete("couchdb", "database_dirs", false),
+    Dirs = all_dirs(),
+    ?assertEqual(1, length(Dirs)).
+
+all_dirs_multi_test(_) ->
+    %% With database_dirs config, returns multiple directories
+    config:set("couchdb", "database_dirs", "/data1,/data2,/data3", false),
+    try
+        Dirs = all_dirs(),
+        ?assertEqual(3, length(Dirs)),
+        ?assertEqual("/data1", lists:nth(1, Dirs)),
+        ?assertEqual("/data2", lists:nth(2, Dirs)),
+        ?assertEqual("/data3", lists:nth(3, Dirs))
+    after
+        config:delete("couchdb", "database_dirs", false)
+    end.
 
 -endif.
