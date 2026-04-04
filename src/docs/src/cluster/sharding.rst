@@ -977,3 +977,90 @@ databases are placed on the directory with the most free space.
 
 See :ref:`config/auto_shard` and :ref:`config/database_paths` for full
 configuration reference.
+
+Capacity Planning
+~~~~~~~~~~~~~~~~~
+
+Before enabling auto-splitting, plan your disk capacity:
+
+- **Per split target:** Each target shard needs ``data + compaction (2x) +
+  index (~1x) = 3x`` the target shard size on the destination node
+- **Example:** Splitting a 80 GB shard 4-way with N=3 replication creates
+  12 copies of ~20 GB each. Total cluster space needed: ~720 GB
+  (12 × 20 GB × 3x headroom)
+- **Pre-flight check:** Auto-shard verifies free space before each split.
+  If insufficient, the split is skipped and logged
+
+**Recommended free space:** Keep at least 40% free on each node to allow
+for splits, compaction, and normal growth.
+
+Performance Impact
+~~~~~~~~~~~~~~~~~~
+
+During an active split:
+
+- **Disk I/O:** Replication reads from source and writes to targets. Impact
+  is proportional to shard size. A 20 GB split takes minutes; a 200 GB
+  split takes longer
+- **CPU:** Minimal — replication is I/O bound, not CPU bound
+- **Memory:** ``mem3_rep`` batches documents (default 500-1000 per batch).
+  Memory usage is proportional to batch size, not shard size
+- **Client latency:** Reads and writes continue normally during split.
+  Brief period during shard map propagation where some requests may need
+  retry (automatic in CouchDB clients)
+
+Use ``max_concurrent_splits = 1`` to minimize I/O impact on busy clusters.
+
+Monitoring
+~~~~~~~~~~
+
+Check auto-shard status via HTTP:
+
+.. code-block:: bash
+
+    $ curl -s $COUCH_URL:5984/_reshard/auto | jq .
+    {
+        "enabled": true,
+        "paused": false,
+        "max_shard_size_bytes": 20000000000,
+        "active_splits": 1,
+        "active_split_shards": ["shards/00000000-ffffffff/bigdb.1234567890"],
+        "scan_count": 42,
+        "splits_triggered": 3,
+        "is_coordinator": true
+    }
+
+**Key metrics to watch:**
+
+- ``active_splits`` — number of splits currently running
+- ``scan_count`` — total scans performed (increasing = scanner is active)
+- ``splits_triggered`` — total splits started since node startup
+- ``is_coordinator`` — this node is running scans (only one per cluster)
+
+Troubleshooting
+~~~~~~~~~~~~~~~
+
+**"Split is stuck"** — Check the CouchDB log for errors. Common causes:
+
+- Target node is down (circuit breaker open)
+- Insufficient disk space on target node
+- Source database is being deleted by another process
+
+**"Verification failed"** — The consistency check after split did not pass.
+The source shard is NOT deleted. Check the log for the specific failure
+(doc count mismatch, missing documents, etc.). Investigate and resolve
+manually before deleting the source.
+
+**"No splits happening"** — Verify:
+
+1. ``enabled = true`` in config
+2. ``paused = false`` (check ``GET /_reshard/auto``)
+3. Shards actually exceed ``max_shard_size_bytes``
+4. Database is not in ``exclude_dbs`` list
+5. Database does not have ``_design/shard_config`` with ``enabled: false``
+6. Within ``maintenance_window``
+7. All circuit breakers closed
+8. This node is the coordinator (``is_coordinator = true`` in status)
+
+**"Too many splits at once"** — Reduce ``max_concurrent_splits`` to 1.
+Increase ``cooldown_ms`` to space out operations.

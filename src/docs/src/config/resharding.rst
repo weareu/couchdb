@@ -237,6 +237,99 @@ Automatic Shard Splitting
     - Mandatory consistency verification before source shard deletion
     - If verification fails, source is NOT deleted and operator is alerted
 
+Split Lifecycle
+---------------
+
+When the auto-shard system decides to split a shard, the following
+sequence executes:
+
+1. **Pre-flight check** — verify target nodes have ``min_free_space_factor``
+   times the target shard size available (default 3x: data + compaction + index)
+2. **Create target DBs** — empty shard databases on destination nodes
+3. **Bulk replication** — ``mem3_rep:go/3`` streams docs from source to
+   targets, routing each doc by CRC32 hash to the correct target range
+4. **Topoff 1** — catch up any writes that occurred during bulk replication
+5. **Build indices** — rebuild view indices on target shards (parallel)
+6. **Topoff 2** — catch up writes during index build
+7. **Copy local docs** — replication checkpoints, security docs
+8. **Topoff 3** — catch up writes during local doc copy
+9. **Update shard map** — atomic update of ``_dbs`` document; clients begin
+   routing to target shards
+10. **Post-map topoff** — catch writes that hit source during map propagation
+11. **Final topoff** — second pass to close the propagation window
+12. **Verify consistency** — doc counts, deleted counts, update sequences,
+    and document distribution across targets must all match
+13. **Delete source** — only after verification passes
+
+If verification fails at step 12, the source shard is **NOT deleted**.
+Both source and targets remain live. The operator must investigate and
+resolve the inconsistency manually.
+
+Split Factor Calculation
+------------------------
+
+The split factor is always rounded up to the nearest power of 2 for
+clean hash range subdivision:
+
++----------------+-------------------+------------------+------------------+
+| Shard Size     | Threshold (20 GB) | Raw Factor       | Actual Factor    |
++================+===================+==================+==================+
+| 30 GB          | 20 GB             | ceil(30/20) = 2  | 2 (2-way split)  |
++----------------+-------------------+------------------+------------------+
+| 80 GB          | 20 GB             | ceil(80/20) = 4  | 4 (4-way split)  |
++----------------+-------------------+------------------+------------------+
+| 200 GB         | 20 GB             | ceil(200/20) = 10| 16 (16-way split)|
++----------------+-------------------+------------------+------------------+
+| 500 GB         | 20 GB             | ceil(500/20) = 25| 32 (32-way split)|
++----------------+-------------------+------------------+------------------+
+
+With ``max_split_factor = 4`` (default), a 200 GB shard splits in rounds:
+
+- **Round 1:** 200 GB → 4 × 50 GB (capped at factor 4)
+- **Round 2:** Each 50 GB → 4 × 12.5 GB (under threshold, done)
+
+Each round triggers automatically at the next scan cycle after cooldown.
+
+Failure Recovery
+----------------
+
+- **Crash before shard map update:** Target databases are cleaned up
+  automatically. No shard map change occurred, so clients are unaffected.
+  The split can be retried.
+
+- **Crash after shard map update:** Target shards are live (clients are
+  already routing to them). The source shard is kept. The operator should
+  verify consistency manually and delete the source when satisfied.
+
+- **Replication crash mid-transfer:** ``mem3_rep`` uses checkpointed
+  replication. On retry, replication resumes from the last checkpoint,
+  not from the beginning. A 4 TB shard that crashes at 3.5 TB resumes
+  from 3.5 TB.
+
+- **Circuit breaker opens during split:** Running splits continue to
+  completion (they use internal replication which handles slow nodes).
+  New scans are blocked until all circuits close.
+
+- **Disk fills during split:** The pre-flight check requires 3x target
+  shard size free. If disk fills despite this (due to other writes),
+  the replication will fail and targets are cleaned up.
+
+Tuning Guide
+------------
+
+**Small clusters (3-6 nodes):** Start with defaults. Reduce
+``max_concurrent_splits`` to 1 if I/O is a concern during splits.
+
+**Large clusters (10+ nodes):** Increase ``max_concurrent_splits`` to 3-4.
+The weighted placement will spread targets across many nodes.
+
+**Cross-datacenter clusters:** Use ``maintenance_window`` to restrict
+splits to off-peak hours. Circuit breakers prevent splits during
+partitions.
+
+**Very large databases (1 TB+):** Keep ``max_split_factor = 4`` to split
+gradually. Each round takes time but uses less temporary space.
+
 .. _config/database_paths:
 
 Per-Database Directory Mapping
@@ -264,3 +357,33 @@ Per-Database Directory Mapping
 
     When neither ``database_paths`` nor ``database_dirs`` is configured,
     all databases use the single ``database_dir`` (backward compatible).
+
+Multi-Directory Setup
+---------------------
+
+To spread databases across multiple mount points:
+
+1. Create the directories and ensure CouchDB has write access
+2. Configure ``database_dirs`` for automatic allocation::
+
+    [couchdb]
+    database_dirs = /mnt/ssd1,/mnt/ssd2,/mnt/hdd1
+
+3. Optionally add per-database rules for explicit placement::
+
+    [database_paths]
+    shards/*/users.* = /mnt/ssd1
+    shards/*/archive_*.* = /mnt/hdd1
+
+4. On startup, CouchDB scans all configured directories for existing
+   ``.couch`` files and registers them in an in-memory path registry
+
+**Limitations:**
+
+- Moving a database between directories requires copying the file and
+  restarting CouchDB (or updating the internal registry)
+- If a directory becomes unavailable, databases on it become inaccessible
+- Path rules are evaluated at database creation time; changing rules does
+  not move existing databases
+- If two directories contain the same database name, the first directory
+  scanned wins

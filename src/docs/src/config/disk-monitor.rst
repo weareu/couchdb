@@ -75,13 +75,45 @@ Disk Monitor Options
             [disk_monitor]
             interactive_view_indexing_threshold = 90
 
-    The disk monitor also provides a per-directory capacity API used by the
-    auto-shard system for capacity-weighted shard placement. When
-    ``database_dirs`` is configured in the ``[couchdb]`` section, the
-    disk monitor tracks free space on each directory independently.
+Multi-Directory Monitoring
+=========================
 
-    The ``dir_capacities/0`` function returns
-    ``[{Path, PercentUsed, FreeBytes, TotalBytes}]`` for all configured
-    database directories. The ``least_used_dir/0`` function returns the
-    directory with the most free space, used when allocating new database
-    files.
+When multiple database directories are configured via ``[couchdb]
+database_dirs``, the disk monitor tracks free space on each directory
+independently. This data is used by the auto-shard system for
+capacity-weighted shard placement.
+
+**Internal API:**
+
+- ``dir_capacities/0`` — returns ``[{Path, PercentUsed, FreeBytes,
+  TotalBytes}]`` for all configured database directories
+- ``least_used_dir/0`` — returns the directory with the most free space,
+  used when allocating new database files
+
+**Configuration:**
+
+.. code-block:: ini
+
+    [couchdb]
+    database_dirs = /mnt/ssd1,/mnt/ssd2,/mnt/hdd1
+
+The disk monitor uses Erlang's ``disksup`` module (part of ``os_mon``)
+to poll disk usage at the same interval as the OS monitor refresh cycle.
+Each configured directory is matched to its underlying physical device
+via file system device IDs.
+
+**Behavior when a directory fills up:**
+
+- Directories above 90% utilization are excluded from
+  ``least_used_dir/0`` results
+- If ALL directories are above 90%, ``least_used_dir/0`` returns an error
+  and new databases fall back to the primary ``database_dir``
+- The ``interactive_database_writes_threshold`` (default 90%) applies to
+  the primary ``database_dir`` device only
+
+**Behavior when a directory is unavailable:**
+
+- If a configured directory does not exist or is unmounted, it is silently
+  skipped during capacity scans
+- Existing databases on that directory become inaccessible until the
+  directory is restored

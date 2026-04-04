@@ -270,6 +270,129 @@ t_verify_fails_when_docs_missing() ->
     end).
 
 %% ===================================================================
+%% 4. Concurrent writes during split — docs MUST NOT be lost
+%% ===================================================================
+
+concurrent_writes_test_() ->
+    {
+        "Concurrent writes during split must not lose data",
+        {
+            setup,
+            fun test_util:start_couch/0,
+            fun test_util:stop_couch/1,
+            [
+                fun t_writes_during_replication_not_lost/0,
+                fun t_deletes_during_replication_counted/0,
+                fun t_double_compact_after_split_stable/0
+            ]
+        }
+    }.
+
+t_writes_during_replication_not_lost() ->
+    ?_test(begin
+        Source = make_source_shard(<<"concurrent">>),
+        Targets = make_split_targets(Source, 2),
+        create_shard_db(Source),
+        try
+            %% Write initial batch
+            write_docs_to_shard(Source#shard.name, 100),
+            ok = mem3_reshard_rep:create_target_dbs(Targets),
+            TMap = mem3_reshard_rep:build_target_map(Targets),
+
+            %% Replicate first pass
+            ok = mem3_reshard_rep:replicate(Source, TMap,
+                [{batch_size, 50}, {batch_count, all}]),
+
+            %% Write MORE docs while targets already have data
+            %% (simulates concurrent writes)
+            write_docs_to_shard_range(Source#shard.name, 101, 150),
+
+            %% Topoff should catch the new writes
+            ok = mem3_reshard_rep:topoff(Source, TMap,
+                [{batch_size, 100}, {batch_count, all}]),
+
+            %% ALL 150 docs must be accounted for
+            SourceCount = get_doc_count(Source#shard.name),
+            TargetCount = lists:sum([get_doc_count(T#shard.name) || T <- Targets]),
+            ?assertEqual(SourceCount, TargetCount),
+            ?assertEqual(150, SourceCount)
+        after
+            cleanup_shard(Source),
+            cleanup_targets(Targets)
+        end
+    end).
+
+t_deletes_during_replication_counted() ->
+    ?_test(begin
+        Source = make_source_shard(<<"delconcur">>),
+        Targets = make_split_targets(Source, 2),
+        create_shard_db(Source),
+        try
+            write_docs_to_shard(Source#shard.name, 50),
+            ok = mem3_reshard_rep:create_target_dbs(Targets),
+            TMap = mem3_reshard_rep:build_target_map(Targets),
+
+            %% Replicate
+            ok = mem3_reshard_rep:replicate(Source, TMap,
+                [{batch_size, 100}, {batch_count, all}]),
+
+            %% Delete some docs from source (simulates deletes during split)
+            delete_docs_from_shard(Source#shard.name, 1, 10),
+
+            %% Topoff should replicate the deletions
+            ok = mem3_reshard_rep:topoff(Source, TMap,
+                [{batch_size, 100}, {batch_count, all}]),
+
+            %% Doc counts must match (40 live, 10 deleted)
+            TargetNames = [T#shard.name || T <- Targets],
+            ?assertEqual(ok,
+                mem3_reshard_rep:verify_doc_counts(
+                    Source#shard.name, TargetNames))
+        after
+            cleanup_shard(Source),
+            cleanup_targets(Targets)
+        end
+    end).
+
+t_double_compact_after_split_stable() ->
+    ?_test(begin
+        Source = make_source_shard(<<"compactstable">>),
+        Targets = make_split_targets(Source, 2),
+        create_shard_db(Source),
+        try
+            write_docs_to_shard(Source#shard.name, 80),
+            ok = mem3_reshard_rep:create_target_dbs(Targets),
+            TMap = mem3_reshard_rep:build_target_map(Targets),
+            ok = mem3_reshard_rep:replicate(Source, TMap,
+                [{batch_size, 100}, {batch_count, all}]),
+
+            %% Compact each target twice — sizes must be stable
+            lists:foreach(fun(#shard{name = TName}) ->
+                {ok, Db1} = couch_db:open_int(TName, [?ADMIN_CTX]),
+                {ok, _} = couch_db:start_compact(Db1),
+                couch_db:close(Db1),
+                wait_compact(TName),
+
+                {ok, Db2} = couch_db:open_int(TName, [?ADMIN_CTX]),
+                S1 = couch_db_engine:get_size_info(Db2),
+                {ok, _} = couch_db:start_compact(Db2),
+                couch_db:close(Db2),
+                wait_compact(TName),
+
+                {ok, Db3} = couch_db:open_int(TName, [?ADMIN_CTX]),
+                S2 = couch_db_engine:get_size_info(Db3),
+                couch_db:close(Db3),
+                Active1 = couch_util:get_value(active, S1),
+                Active2 = couch_util:get_value(active, S2),
+                ?assertEqual(Active1, Active2)
+            end, Targets)
+        after
+            cleanup_shard(Source),
+            cleanup_targets(Targets)
+        end
+    end).
+
+%% ===================================================================
 %% Helpers
 %% ===================================================================
 
@@ -338,3 +461,51 @@ cleanup_targets(Targets) ->
     lists:foreach(fun(#shard{name = Name}) ->
         catch couch_server:delete(Name, [?ADMIN_CTX])
     end, Targets).
+
+write_docs_to_shard_range(ShardName, From, To) ->
+    {ok, Db} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
+    try
+        lists:foreach(fun(I) ->
+            Id = list_to_binary(io_lib:format("doc-~4..0B", [I])),
+            Body = {[{<<"n">>, I}, {<<"data">>,
+                base64:encode(crypto:strong_rand_bytes(256))}]},
+            Rev = couch_hash:md5_hash(term_to_binary({Id, I, extra})),
+            Doc = #doc{id = Id, body = Body, revs = {1, [Rev]}},
+            {ok, _} = couch_db:update_docs(Db, [Doc], [replicated_changes])
+        end, lists:seq(From, To))
+    after
+        couch_db:close(Db)
+    end.
+
+delete_docs_from_shard(ShardName, From, To) ->
+    {ok, Db} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
+    try
+        lists:foreach(fun(I) ->
+            Id = list_to_binary(io_lib:format("doc-~4..0B", [I])),
+            case couch_db:open_doc(Db, Id, []) of
+                {ok, #doc{revs = {Pos, [Rev | _]}} = _Doc} ->
+                    DelRev = couch_hash:md5_hash(term_to_binary({Id, deleted, I})),
+                    DelDoc = #doc{id = Id, revs = {Pos + 1, [DelRev, Rev]},
+                                  deleted = true},
+                    {ok, _} = couch_db:update_docs(Db, [DelDoc], [replicated_changes]);
+                _ ->
+                    ok
+            end
+        end, lists:seq(From, To))
+    after
+        couch_db:close(Db)
+    end.
+
+wait_compact(DbName) ->
+    wait_compact(DbName, 50).
+
+wait_compact(_DbName, 0) ->
+    error(compact_timeout);
+wait_compact(DbName, N) ->
+    {ok, Db} = couch_db:open_int(DbName, [?ADMIN_CTX]),
+    IsDone = try not is_pid(couch_db:get_compactor_pid(Db))
+        after couch_db:close(Db) end,
+    case IsDone of
+        true -> ok;
+        false -> timer:sleep(100), wait_compact(DbName, N - 1)
+    end.
