@@ -55,7 +55,8 @@
     verify_doc_counts/2,
     verify_doc_distribution/3,
     preflight_check/3,
-    delete_source/1
+    delete_source/1,
+    create_replication_checkpoints/2
 ]).
 
 -record(split_state, {
@@ -336,10 +337,15 @@ run_split(#split_state{state = creating_targets} = St) ->
     end;
 
 run_split(#split_state{state = replicating} = St) ->
-    #split_state{source = Source, target_map = TMap} = St,
+    #split_state{source = Source, target_map = TMap, targets = Targets} = St,
     couch_log:notice("mem3_reshard_rep: bulk replication from ~s", [Source#shard.name]),
     case replicate(Source, TMap, [{batch_size, 1000}, {batch_count, all}]) of
         ok ->
+            %% Create artificial mem3_rep checkpoints so that:
+            %% 1. Topoff phases resume from here (not from seq=0)
+            %% 2. After split, mem3_sync knows where targets left off
+            %%    (prevents massive re-replication storm)
+            create_replication_checkpoints(Source, Targets),
             run_split(St#split_state{state = topoff_1});
         {error, Reason} ->
             cleanup_targets_on_failure(St),
@@ -440,6 +446,57 @@ run_split(#split_state{state = deleting_source} = St) ->
             ok;
         {error, _} = Err ->
             Err
+    end.
+
+%% Create artificial mem3_rep checkpoint docs in both source and target.
+%% This prevents mem3_sync from re-replicating the entire shard content
+%% after the split completes. Without these checkpoints, every target
+%% shard would trigger a full re-sync from all other cluster nodes.
+create_replication_checkpoints(#shard{name = SourceName}, Targets) ->
+    UniqueTargets = unique_range_targets(Targets),
+    try
+        {ok, SDb} = couch_db:open_int(SourceName, [?ADMIN_CTX]),
+        try
+            {ok, SInfo} = couch_db:get_db_info(SDb),
+            Seq = couch_util:get_value(update_seq, SInfo),
+            SourceUUID = couch_db:get_uuid(SDb),
+            Timestamp = list_to_binary(mem3_util:iso8601_timestamp()),
+            Node = atom_to_binary(config:node_name(), utf8),
+            lists:foreach(fun(#shard{name = TName}) ->
+                try
+                    {ok, TDb} = couch_db:open_int(TName, [?ADMIN_CTX]),
+                    try
+                        TargetUUID = couch_db:get_uuid(TDb),
+                        History = {[
+                            {<<"source_node">>, Node},
+                            {<<"source_uuid">>, SourceUUID},
+                            {<<"source_seq">>, Seq},
+                            {<<"timestamp">>, Timestamp},
+                            {<<"target_node">>, Node},
+                            {<<"target_uuid">>, TargetUUID},
+                            {<<"target_seq">>, Seq}
+                        ]},
+                        Body = {[
+                            {<<"seq">>, Seq},
+                            {<<"target_uuid">>, TargetUUID},
+                            {<<"history">>, {[{Node, [History]}]}}
+                        ]},
+                        Id = mem3_rep:make_local_id(SourceUUID, TargetUUID),
+                        Doc = #doc{id = Id, body = Body},
+                        {ok, _} = couch_db:update_doc(SDb, Doc, []),
+                        {ok, _} = couch_db:update_doc(TDb, Doc, [])
+                    after
+                        couch_db:close(TDb)
+                    end
+                catch
+                    _:_ -> ok  % Best effort — topoff will still work
+                end
+            end, UniqueTargets)
+        after
+            couch_db:close(SDb)
+        end
+    catch
+        _:_ -> ok
     end.
 
 %% Clean up target DBs when split fails BEFORE shard map update.
