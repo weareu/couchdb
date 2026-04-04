@@ -63,10 +63,21 @@ submit_jobs(Shards, EndPoint, ExtraArgs) ->
     submit_jobs(Shards, fabric_rpc, EndPoint, ExtraArgs).
 
 submit_jobs(Shards, Module, EndPoint, ExtraArgs) ->
-    lists:map(
+    lists:filtermap(
         fun(#shard{node = Node, name = ShardName} = Shard) ->
-            Ref = rexi:cast(Node, {Module, EndPoint, [ShardName | ExtraArgs]}),
-            Shard#shard{ref = Ref}
+            case mem3_circuit_breaker:allow(Node) of
+                ok ->
+                    Ref = rexi:cast(Node, {Module, EndPoint, [ShardName | ExtraArgs]}),
+                    {true, Shard#shard{ref = Ref}};
+                {error, circuit_open} ->
+                    % Node is behind a broken cable or unreachable.
+                    % Skip it — let quorum be met by healthy replicas.
+                    couch_log:debug(
+                        "Circuit breaker: skipping ~s for ~s/~s",
+                        [Node, Module, EndPoint]
+                    ),
+                    false
+            end
         end,
         Shards
     ).
