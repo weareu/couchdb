@@ -139,3 +139,6 @@ test/javascript/junit.xml
 
 .tool-versions
 mise.local.toml
+
+# Local planning docs — never check in
+docs/plans/
