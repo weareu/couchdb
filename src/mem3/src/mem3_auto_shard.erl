@@ -366,7 +366,22 @@ is_in_cooldown(DbName, #state{cooldowns = Cooldowns, cooldown_ms = CooldownMs}, 
     end.
 
 is_already_splitting(ShardName, #state{active_splits = Active}) ->
-    maps:is_key(ShardName, Active).
+    maps:is_key(ShardName, Active) orelse is_legacy_reshard_active(ShardName).
+
+%% Check if the old mem3_reshard system has an active job for this shard.
+%% Prevents conflicts between auto-split and manual split.
+is_legacy_reshard_active(ShardName) ->
+    try
+        Jobs = mem3_reshard:jobs(),
+        lists:any(fun(JobProps) ->
+            Source = couch_util:get_value(source, JobProps, <<>>),
+            State = couch_util:get_value(job_state, JobProps, <<>>),
+            Source =:= ShardName andalso
+            (State =:= <<"running">> orelse State =:= <<"new">>)
+        end, Jobs)
+    catch
+        _:_ -> false
+    end.
 
 %% @doc Check if a database has auto-split disabled via design doc.
 -spec is_split_disabled_by_ddoc(binary()) -> boolean().

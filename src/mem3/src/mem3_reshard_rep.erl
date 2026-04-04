@@ -677,6 +677,16 @@ verify_update_seqs(SourceName, TargetNames) ->
     end.
 
 %% @doc Build view indices on target shards.
+%%
+%% Only rebuilds couch_mrview (MapReduce) indices. Other index types:
+%%   - Nouveau (Lucene search): rebuilds automatically on first query.
+%%     Index is keyed by shard name — new shards get new indices.
+%%   - Dreyfus (Clouseau search): same as nouveau — rebuilds on demand.
+%%   - Mango (_index): stored as design docs, transfer via replication.
+%%     The actual index files rebuild on first query.
+%%
+%% Old indices for the deleted source shard become orphaned and are
+%% cleaned up by their respective garbage collection mechanisms.
 build_indices(Targets) ->
     UniqueTargets = unique_range_targets(Targets),
     lists:foreach(fun(#shard{name = Name}) ->
