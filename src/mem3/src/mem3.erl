@@ -460,16 +460,30 @@ ping_nodes() ->
         fun(N) -> node_info(N, <<"zone">>) =:= LocalZone end,
         Nodes
     ),
-    % Run both zone pings in parallel to avoid sequential delay
+    % Run both zone pings in parallel using monitors (not links)
+    % to avoid orphaned processes on timeout
     Self = self(),
     SameRef = make_ref(),
     CrossRef = make_ref(),
-    spawn_link(fun() -> Self ! {SameRef, ping_nodes(SameZoneNodes, SameZoneTimeout)} end),
-    spawn_link(fun() -> Self ! {CrossRef, ping_nodes(CrossZoneNodes, CrossZoneTimeout)} end),
-    SameResults = receive {SameRef, R1} -> R1
-                  after SameZoneTimeout + 1000 -> [] end,
-    CrossResults = receive {CrossRef, R2} -> R2
-                   after CrossZoneTimeout + 1000 -> [] end,
+    {Pid1, Mon1} = spawn_monitor(fun() ->
+        Self ! {SameRef, ping_nodes(SameZoneNodes, SameZoneTimeout)}
+    end),
+    {Pid2, Mon2} = spawn_monitor(fun() ->
+        Self ! {CrossRef, ping_nodes(CrossZoneNodes, CrossZoneTimeout)}
+    end),
+    SameResults = receive
+        {SameRef, R1} -> R1
+    after SameZoneTimeout + 1000 ->
+        exit(Pid1, kill), []
+    end,
+    CrossResults = receive
+        {CrossRef, R2} -> R2
+    after CrossZoneTimeout + 1000 ->
+        exit(Pid2, kill), []
+    end,
+    % Flush monitor DOWN messages
+    receive {'DOWN', Mon1, _, _, _} -> ok after 0 -> ok end,
+    receive {'DOWN', Mon2, _, _, _} -> ok after 0 -> ok end,
     lists:sort(SameResults ++ CrossResults).
 
 -spec ping_nodes(Timeout :: pos_integer()) -> [{node(), pos_integer() | Error :: term()}].

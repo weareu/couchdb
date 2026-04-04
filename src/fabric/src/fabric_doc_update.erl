@@ -138,14 +138,6 @@ handle_message({ok, Replies}, Worker, #acc{} = Acc0) ->
                     {stop, {ok, FinalReplies}}
             end;
         _ ->
-<<<<<<< HEAD
-            {ok,
-                start_workers(Acc0#acc{
-                    waiting_count = WaitingCount - 1,
-                    grouped_docs = NewGrpDocs,
-                    reply = DocReplyDict
-                })}
-=======
             % Not all docs have a reply yet, but check if the docs that
             % DO have replies already meet quorum. This enables early
             % return when same-zone replicas respond before cross-zone
@@ -154,13 +146,13 @@ handle_message({ok, Replies}, Worker, #acc{} = Acc0) ->
                 {ok, FinalReplies} ->
                     {stop, {ok, FinalReplies}};
                 continue ->
-                    {ok, Acc0#acc{
-                        waiting_count = WaitingCount - 1,
-                        grouped_docs = NewGrpDocs,
-                        reply = DocReplyDict
-                    }}
+                    {ok,
+                        start_workers(Acc0#acc{
+                            waiting_count = WaitingCount - 1,
+                            grouped_docs = NewGrpDocs,
+                            reply = DocReplyDict
+                        })}
             end
->>>>>>> 5568cfe74 (feat: cross-datacenter clustering improvements with chaos tests)
     end;
 handle_message({missing_stub, Stub}, _, _) ->
     throw({missing_stub, Stub});
