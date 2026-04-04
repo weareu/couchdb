@@ -46,10 +46,11 @@
     lookup/1
 ]).
 
-%% For testing
+%% For testing and shared utilities
 -export([
     match_path_rule/2,
-    get_path_rules/0
+    get_path_rules/0,
+    glob_to_regexp/1
 ]).
 
 -define(ETS_TABLE, couch_multidir_registry).
