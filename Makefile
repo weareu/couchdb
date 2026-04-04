@@ -75,7 +75,7 @@ DESTDIR=
 
 # Rebar options
 apps=
-skip_deps=meck,mochiweb,triq,proper,snappy,ibrowse,gun,recon
+skip_deps=meck,mochiweb,triq,proper,ibrowse,gun,recon
 suites=
 tests=
 
@@ -143,13 +143,13 @@ endif
 # target: fauxton - Build Fauxton web UI
 fauxton: share/www
 
-
 .PHONY: escriptize
 # target: escriptize - Build CLI tools
 escriptize: couch-core
 	@$(REBAR) -r escriptize apps=weatherreport
 	@cp src/weatherreport/weatherreport bin/weatherreport
-
+	@$(REBAR) -r escriptize apps=couch_special_compact
+	@cp src/couch_special_compact/couch_special_compact bin/couch_special_compact
 
 ################################################################################
 # Testing
@@ -408,6 +408,7 @@ release: all
 	@rm -rf rel/couchdb
 	@$(REBAR) generate # make full erlang release
 	@cp bin/weatherreport rel/couchdb/bin/weatherreport
+	@cp bin/couch_special_compact rel/couchdb/bin/couch_special_compact
 
 ifeq ($(with_spidermonkey), true)
 	@mkdir -p rel/couchdb/share/server
@@ -472,6 +473,7 @@ clean:
 	@rm -rf .rebar/
 	@rm -f bin/couchjs
 	@rm -f bin/weatherreport
+	@rm -f bin/couch_special_compact
 	@find src/*/ebin \
 	  -not -path 'src/cowlib/ebin/cowlib.app' \
 	  -not -path 'src/cowlib/ebin' \
