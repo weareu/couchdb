@@ -13,7 +13,8 @@
 -module(mem3_reshard_httpd).
 
 -export([
-    handle_reshard_req/1
+    handle_reshard_req/1,
+    handle_auto_shard_req/1
 ]).
 
 -import(couch_httpd, [
@@ -234,7 +235,64 @@ handle_reshard_req(
             throw({bad_request, <<"State field not `running` or `stopped`">>})
     end;
 handle_reshard_req(#httpd{path_parts = [_, ?JOBS, _, ?STATE]} = Req) ->
-    send_method_not_allowed(Req, "GET,HEAD,PUT").
+    send_method_not_allowed(Req, "GET,HEAD,PUT");
+
+%% ===================================================================
+%% Auto-shard endpoints: /_reshard/auto
+%% ===================================================================
+
+% GET /_reshard/auto — status
+handle_reshard_req(#httpd{method = 'GET', path_parts = [_, <<"auto">>]} = Req) ->
+    Status = mem3_auto_shard:status(),
+    send_json(Req, {maps:to_list(Status)});
+% PUT /_reshard/auto — update config
+handle_reshard_req(
+    #httpd{method = 'PUT', path_parts = [_, <<"auto">>]} = Req
+) ->
+    couch_httpd:validate_ctype(Req, "application/json"),
+    {Props} = couch_httpd:json_body_obj(Req),
+    apply_auto_config(Props),
+    send_json(Req, {[{ok, true}]});
+% POST /_reshard/auto/scan — trigger scan
+handle_reshard_req(
+    #httpd{method = 'POST', path_parts = [_, <<"auto">>, <<"scan">>]} = Req
+) ->
+    mem3_auto_shard:trigger_scan(),
+    send_json(Req, 202, {[{ok, true}]});
+% POST /_reshard/auto/pause
+handle_reshard_req(
+    #httpd{method = 'POST', path_parts = [_, <<"auto">>, <<"pause">>]} = Req
+) ->
+    mem3_auto_shard:pause(),
+    send_json(Req, {[{ok, true}]});
+% POST /_reshard/auto/resume
+handle_reshard_req(
+    #httpd{method = 'POST', path_parts = [_, <<"auto">>, <<"resume">>]} = Req
+) ->
+    mem3_auto_shard:resume(),
+    send_json(Req, {[{ok, true}]});
+handle_reshard_req(#httpd{path_parts = [_, <<"auto">> | _]} = Req) ->
+    send_method_not_allowed(Req, "GET,PUT,POST").
+
+handle_auto_shard_req(Req) ->
+    handle_reshard_req(Req).
+
+apply_auto_config(Props) ->
+    case couch_util:get_value(<<"enabled">>, Props) of
+        true -> config:set("auto_shard", "enabled", "true", false);
+        false -> config:set("auto_shard", "enabled", "false", false);
+        _ -> ok
+    end,
+    case couch_util:get_value(<<"max_shard_size_bytes">>, Props) of
+        Size when is_integer(Size), Size > 0 ->
+            mem3_auto_shard:set_threshold(Size);
+        _ -> ok
+    end,
+    case couch_util:get_value(<<"paused">>, Props) of
+        true -> mem3_auto_shard:pause();
+        false -> mem3_auto_shard:resume();
+        _ -> ok
+    end.
 
 reject_if_disabled() ->
     case mem3_reshard:is_disabled() of

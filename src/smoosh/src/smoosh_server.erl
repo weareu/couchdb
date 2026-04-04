@@ -464,6 +464,12 @@ get_priority(Channel, DiskSize, DataSize, NeedsUpgrade) ->
             0;
         Priority =:= "slack" ->
             DiskSize - DataSize;
+        Priority =:= "size", DiskSize =< MinPriority ->
+            0;
+        Priority =:= "size", DiskSize > MaxPriority ->
+            0;
+        Priority =:= "size" ->
+            DiskSize;
         true ->
             0
     end.

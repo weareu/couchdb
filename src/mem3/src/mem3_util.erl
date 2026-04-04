@@ -50,6 +50,7 @@
 -export([build_ordered_shards/2, downcast/1]).
 
 -export([create_partition_map/4, name_shard/1]).
+-export([capacity_weighted_placement/3]).
 -deprecated({create_partition_map, 4, eventually}).
 -deprecated({name_shard, 1, eventually}).
 
@@ -98,6 +99,46 @@ attach_nodes(Shards, Acc, [], UsedNodes) ->
     attach_nodes(Shards, Acc, lists:reverse(UsedNodes), []);
 attach_nodes([S | Rest], Acc, [Node | Nodes], UsedNodes) ->
     attach_nodes(Rest, [S#shard{node = Node} | Acc], Nodes, [Node | UsedNodes]).
+
+%% @doc Capacity-weighted shard placement.
+%% Like attach_nodes/4 but picks nodes based on free disk space
+%% instead of round-robin. Falls back to round-robin when
+%% weighted_placement is disabled or capacity data unavailable.
+-spec capacity_weighted_placement([#shard{}], [node()], pos_integer()) -> [#shard{}].
+capacity_weighted_placement(Shards, Nodes, N) ->
+    case config:get_boolean("auto_shard", "weighted_placement", false) of
+        false ->
+            attach_nodes(Shards, [], Nodes, []);
+        true ->
+            try
+                Caps = mem3_node_capacity:all_capacities(),
+                case maps:size(Caps) of
+                    0 ->
+                        attach_nodes(Shards, [], Nodes, []);
+                    _ ->
+                        weighted_attach(Shards, Nodes, N, Caps)
+                end
+            catch
+                _:_ ->
+                    attach_nodes(Shards, [], Nodes, [])
+            end
+    end.
+
+weighted_attach(Shards, Nodes, _N, Caps) ->
+    %% Score nodes: free bytes minus penalty for existing load
+    Scored = mem3_node_capacity:score_nodes(Caps, 0),
+    %% Filter to only configured nodes
+    NodeSet = sets:from_list(Nodes),
+    Available = [{Score, Node} || {Score, Node} <- Scored,
+                                  sets:is_element(Node, NodeSet)],
+    case Available of
+        [] ->
+            attach_nodes(Shards, [], Nodes, []);
+        _ ->
+            %% Assign shards to highest-scored nodes, cycling
+            SortedNodes = [Node || {_Score, Node} <- Available],
+            attach_nodes(Shards, [], SortedNodes, [])
+    end.
 
 open_db_doc(DocId) ->
     {ok, Db} = couch_db:open(mem3_sync:shards_db(), [?ADMIN_CTX]),
