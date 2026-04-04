@@ -240,7 +240,11 @@ do_start_split(ShardName, Factor, State) ->
                         byte_size_to_int(ShardName, State), Factor, Caps) of
                     ok ->
                         {Pid, _Ref} = spawn_monitor(fun() ->
+                            MaxMs = config:get_integer(
+                                "auto_shard", "max_split_timeout_ms", 14400000),
+                            {ok, TRef} = timer:exit_after(MaxMs, self(), split_timeout),
                             Result = mem3_reshard_rep:split(Shard, Factor, TargetNodes),
+                            timer:cancel(TRef),
                             exit({split_result, ShardName, Result})
                         end),
                         DbName = mem3:dbname(ShardName),
@@ -340,7 +344,7 @@ all_circuits_closed() ->
 in_maintenance_window(always) ->
     true;
 in_maintenance_window({StartHour, EndHour}) ->
-    {_, {Hour, _, _}} = calendar:local_time(),
+    {_, {Hour, _, _}} = calendar:universal_time(),
     case StartHour =< EndHour of
         true -> Hour >= StartHour andalso Hour < EndHour;
         false -> Hour >= StartHour orelse Hour < EndHour
@@ -386,8 +390,29 @@ is_legacy_reshard_active(ShardName) ->
 %% @doc Check if a database has auto-split disabled via design doc.
 -spec is_split_disabled_by_ddoc(binary()) -> boolean().
 is_split_disabled_by_ddoc(DbName) ->
+    %% DbName might be a logical name ("mydb") or a shard name
+    %% ("shards/00000000-ffffffff/mydb.1234567890").
+    %% We need to open ANY local shard of this database to read the ddoc.
     try
-        {ok, Db} = couch_db:open_int(DbName, [?ADMIN_CTX]),
+        %% Try opening directly first (works for non-shard names in eunit)
+        OpenName = case DbName of
+            <<"shards/", _/binary>> ->
+                %% It's a shard name — use it directly
+                DbName;
+            _ ->
+                %% Logical DB name — try to find a local shard
+                case catch mem3:shards(DbName) of
+                    Shards when is_list(Shards), Shards =/= [] ->
+                        LocalShards = [S || #shard{node = N} = S <- Shards,
+                                            N =:= node()],
+                        case LocalShards of
+                            [#shard{name = SName} | _] -> SName;
+                            [] -> DbName
+                        end;
+                    _ -> DbName
+                end
+        end,
+        {ok, Db} = couch_db:open_int(OpenName, [?ADMIN_CTX]),
         try
             case couch_db:open_doc(Db, <<"_design/shard_config">>, []) of
                 {ok, #doc{body = {Props}}} ->

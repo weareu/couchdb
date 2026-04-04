@@ -78,6 +78,7 @@
 -spec subdivide_range([non_neg_integer()], pos_integer()) -> [[non_neg_integer()]].
 subdivide_range([Begin, End], Factor) when
     is_integer(Factor), Factor >= 2,
+    (Factor band (Factor - 1)) =:= 0,  % must be power of 2
     (End - Begin + 1) >= Factor
 ->
     Width = End - Begin + 1,
@@ -394,9 +395,14 @@ run_split(#split_state{state = updating_map} = St) ->
     case update_shard_map(Source, Targets) of
         ok -> run_split(St#split_state{state = topoff_post_map});
         {error, _} = Err ->
-            %% Map update failed — targets exist but map unchanged.
-            %% Clean up targets since no shard map change occurred.
-            cleanup_targets_on_failure(St),
+            %% DO NOT cleanup targets — the shard map update may have
+            %% partially succeeded (doc written but propagation failed).
+            %% Deleting targets that clients may be routing to = DATA LOSS.
+            %% Leave both source and targets live. Operator investigates.
+            couch_log:error(
+                "mem3_reshard_rep: shard map update failed for ~s. "
+                "Source and targets both remain. Manual investigation required.",
+                [Source#shard.name]),
             Err
     end;
 
@@ -590,11 +596,12 @@ copy_local_docs(#shard{name = SourceName}, TMap) ->
 %% This is the point of no return — after this, clients route to targets.
 -spec update_shard_map(#shard{}, [#shard{}]) -> ok | {error, term()}.
 update_shard_map(Source, Targets) ->
-    %% Use mem3_reshard_dbdoc which handles by_node, by_range, changelog,
-    %% and waits for propagation to all live nodes.
-    %% It expects a #job{} record, so we build a minimal one.
+    update_shard_map(Source, Targets, 5).
+
+update_shard_map(_Source, _Targets, 0) ->
+    {error, shard_map_conflict_retries_exhausted};
+update_shard_map(Source, Targets, RetriesLeft) ->
     try
-        %% Get unique targets (one per range, for current node)
         UniqueTargets = unique_range_targets(Targets),
         DocId = mem3:dbname(Source#shard.name),
         case mem3:get_db_doc(DocId) of
@@ -604,9 +611,13 @@ update_shard_map(Source, Targets) ->
                 NewDoc = Doc#doc{body = NewBody},
                 case mem3:update_db_doc(NewDoc) of
                     {ok, _} ->
-                        %% Wait for propagation
                         wait_shard_map_propagated(Source, 60),
                         ok;
+                    {error, conflict} ->
+                        %% Another split updated the same _dbs doc.
+                        %% Re-read and retry with jitter.
+                        timer:sleep(1000 + rand:uniform(2000)),
+                        update_shard_map(Source, Targets, RetriesLeft - 1);
                     {error, UpdateError} ->
                         {error, {shard_map_update_failed, UpdateError}}
                 end;

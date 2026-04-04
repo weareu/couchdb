@@ -256,8 +256,9 @@ scan_dir(Dir, Extensions) ->
                 ok
             end, ok)
     catch
-        _:_ ->
-            %% Directory may not exist yet
+        _:ScanError ->
+            couch_log:warning("couch_multidir: failed to scan directory ~s: ~p",
+                [Dir, ScanError]),
             ok
     end.
 

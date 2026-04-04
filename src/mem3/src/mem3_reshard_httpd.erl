@@ -289,8 +289,10 @@ apply_auto_config(Props) ->
         _ -> ok
     end,
     case couch_util:get_value(<<"max_shard_size_bytes">>, Props) of
-        Size when is_integer(Size), Size > 0 ->
+        Size when is_integer(Size), Size >= 1073741824 ->
             mem3_auto_shard:set_threshold(Size);
+        Size when is_integer(Size) ->
+            throw({bad_request, <<"Minimum threshold is 1 GB (1073741824 bytes)">>});
         _ -> ok
     end,
     case couch_util:get_value(<<"paused">>, Props) of
