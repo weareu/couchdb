@@ -445,32 +445,16 @@ copy_docs(St, #st{} = NewSt, MixedInfos, Retry, DbName) ->
     ShortDbName = binary_to_list(mem3:dbname(DbName)),
     RetentionOpts = erlang:get(compaction_retention_opts),
 
-    % Filter out documents that exceed retention period (complete removal).
-    % NOTE: This reads document bodies to check date fields. Documents that
-    % pass the filter will have their bodies read again during copy. This
-    % double-read only occurs when remove_after_days > 0 and only for docs
-    % that are NOT removed (removed docs skip the second read entirely).
-    {NewInfos0b, _RemovedCount} = case RetentionOpts of
+    % SPEED: Batch retention date check using a single pread_terms call
+    % for all doc bodies, instead of reading one-at-a-time in should_remove_doc.
+    % This reduces disk I/O syscalls from N to 1 for the retention filter pass.
+    NewInfos0c = case RetentionOpts of
         #{remove_after_days := RemoveDays} when RemoveDays > 0 ->
             #{date_fields := DateFields} = RetentionOpts,
-            lists:foldl(
-                fun(Info, {Kept, Removed}) ->
-                    DocId = Info#full_doc_info.id,
-                    case should_remove_doc(St, Info, DateFields, RemoveDays) of
-                        true ->
-                            log_retained_removal(ShortDbName, DocId),
-                            {Kept, Removed + 1};
-                        false ->
-                            {[Info | Kept], Removed}
-                    end
-                end,
-                {[], 0},
-                NewInfos0
-            );
+            batch_retention_filter(St, NewInfos0, DateFields, RemoveDays, ShortDbName);
         _ ->
-            {NewInfos0, 0}
+            NewInfos0
     end,
-    NewInfos0c = lists:reverse(NewInfos0b),
 
     ExtractEnabled = erlang:get(compaction_extract_enabled),
     ExtractAfterDays = case RetentionOpts of
@@ -715,47 +699,74 @@ copy_doc_attachments_extract(#st{} = SrcSt, SrcSp, DstSt, DocId, DbName,
     end.
 
 %% -------------------------------------------------------------------
-%% Retention: determine if a document should be removed entirely
-%% during compaction (skipped from the new file).
+%% Retention: batch filter documents for removal.
+%% SPEED: Collects all winning leaf pointers, reads bodies in one
+%% batch call to couch_file:pread_terms, checks dates, filters.
+%% This reduces disk I/O from N syscalls to 1 for the retention pass.
 %% -------------------------------------------------------------------
-should_remove_doc(St, #full_doc_info{} = Info, DateFields, RemoveDays) ->
-    % Don't remove design docs or local docs
-    case Info#full_doc_info.id of
-        <<"_design/", _/binary>> -> false;
-        <<"_local/", _/binary>> -> false;
-        _ ->
-            % Don't remove already-deleted docs (they're tiny tombstones)
-            case Info#full_doc_info.deleted of
-                true -> false;
-                false ->
-                    % Read the winning revision body to check the date
-                    try
-                        WinSp = get_winning_leaf_ptr(Info#full_doc_info.rev_tree),
-                        case WinSp of
-                            undefined -> false;
-                            _ ->
-                                {ok, {BodyData0, _BinInfos}} =
-                                    couch_file:pread_term(St#st.fd, WinSp),
-                                BodyData = case BodyData0 of
-                                    _ when is_binary(BodyData0) ->
-                                        couch_compress:decompress(BodyData0);
-                                    _ -> BodyData0
-                                end,
-                                case BodyData of
-                                    {Props} when is_list(Props) ->
-                                        case find_date_in_props(Props, DateFields) of
-                                            undefined -> false;
-                                            {ok, DateTuple} ->
-                                                is_older_than_days(DateTuple, RemoveDays)
-                                        end;
-                                    _ ->
-                                        false
-                                end
-                        end
-                    catch
-                        _:_ -> false
-                    end
+batch_retention_filter(St, Infos, DateFields, RemoveDays, ShortDbName) ->
+    % Partition into candidates (can be removed) and protected (never removed)
+    {Candidates, Protected} = lists:partition(
+        fun(#full_doc_info{id = Id, deleted = Del}) ->
+            case Id of
+                <<"_design/", _/binary>> -> false;
+                <<"_local/", _/binary>> -> false;
+                _ -> not Del
             end
+        end,
+        Infos
+    ),
+    case Candidates of
+        [] ->
+            Infos;
+        _ ->
+            % Collect winning leaf pointers for all candidates
+            SpInfoPairs = lists:filtermap(
+                fun(Info) ->
+                    case get_winning_leaf_ptr(Info#full_doc_info.rev_tree) of
+                        undefined -> false;
+                        Sp -> {true, {Sp, Info}}
+                    end
+                end,
+                Candidates
+            ),
+            {Sps, InfosWithSp} = lists:unzip(SpInfoPairs),
+            % Batch read all bodies at once
+            {ok, Bodies} = couch_file:pread_terms(St#st.fd, Sps),
+            % Check each body's date field
+            Kept = lists:filtermap(
+                fun({{BodyData0, _BinInfos}, Info}) ->
+                    BodyData = case BodyData0 of
+                        _ when is_binary(BodyData0) ->
+                            couch_compress:decompress(BodyData0);
+                        _ -> BodyData0
+                    end,
+                    ShouldRemove = case BodyData of
+                        {Props} when is_list(Props) ->
+                            case find_date_in_props(Props, DateFields) of
+                                undefined -> false;
+                                {ok, DateTuple} ->
+                                    is_older_than_days(DateTuple, RemoveDays)
+                            end;
+                        _ -> false
+                    end,
+                    case ShouldRemove of
+                        true ->
+                            log_retained_removal(ShortDbName, Info#full_doc_info.id),
+                            false;
+                        false ->
+                            {true, Info}
+                    end
+                end,
+                lists:zip(Bodies, InfosWithSp)
+            ),
+            % Also keep candidates that had no winning leaf pointer
+            NoSpCandidates = [I || I <- Candidates,
+                not lists:keymember(I, 2, SpInfoPairs)],
+            % Maintain original ordering
+            KeptSet = sets:from_list(
+                [I#full_doc_info.id || I <- Kept ++ NoSpCandidates ++ Protected]),
+            [I || I <- Infos, sets:is_element(I#full_doc_info.id, KeptSet)]
     end.
 
 get_winning_leaf_ptr(RevTree) ->
