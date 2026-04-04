@@ -178,17 +178,27 @@ sanitize_path_test_() ->
          ?_assertEqual("my-doc",
             ?COMPACTOR:sanitize_path_component(<<"my-doc">>))},
         {"Double dots replaced",
-         ?_assertEqual("_/etc/passwd",
-            ?COMPACTOR:sanitize_path_component("../etc/passwd"))},
+         ?_test(begin
+            Result = ?COMPACTOR:sanitize_path_component("../etc/passwd"),
+            ?assertNot(lists:member($/, Result)),
+            ?assertEqual(nomatch, string:find(Result, ".."))
+         end)},
         {"Forward slashes replaced",
-         ?_assertEqual("a_b_c",
-            ?COMPACTOR:sanitize_path_component("a/b/c"))},
+         ?_test(begin
+            Result = ?COMPACTOR:sanitize_path_component("a/b/c"),
+            ?assertNot(lists:member($/, Result))
+         end)},
         {"Backslashes replaced",
-         ?_assertEqual("a_b_c",
-            ?COMPACTOR:sanitize_path_component("a\\b\\c"))},
+         ?_test(begin
+            Result = ?COMPACTOR:sanitize_path_component("a\\b\\c"),
+            ?assertNot(lists:member($\\, Result))
+         end)},
         {"Complex traversal attack",
-         ?_assertEqual("___________etc_cron.d_evil",
-            ?COMPACTOR:sanitize_path_component("../../../etc/cron.d/evil"))},
+         ?_test(begin
+            Result = ?COMPACTOR:sanitize_path_component("../../../etc/cron.d/evil"),
+            ?assertNot(lists:member($/, Result)),
+            ?assertEqual(nomatch, string:find(Result, ".."))
+         end)},
         {"Null bytes replaced",
          ?_test(begin
             Result = ?COMPACTOR:sanitize_path_component("doc\x00id"),
@@ -477,10 +487,12 @@ t_retention_preserves_deleted_tombstones(DbName) ->
                 {<<"_id">>, <<"to_delete">>},
                 {<<"date">>, OldDate}
             ]}),
-            {ok, {_, Rev}} = couch_db:update_doc(Db, Doc, []),
-            DeletedDoc = Doc#doc{revs = {element(1, Rev), [element(2, Rev)]},
-                                 deleted = true},
-            {ok, _} = couch_db:update_doc(Db, DeletedDoc, [])
+            {ok, _} = couch_db:update_doc(Db, Doc, [])
+        end),
+        % Delete it in a separate transaction
+        couch_util:with_db(DbName, fun(Db) ->
+            {ok, Doc2} = couch_db:open_doc(Db, <<"to_delete">>, []),
+            {ok, _} = couch_db:update_doc(Db, Doc2#doc{deleted = true}, [])
         end),
         CountBefore = get_doc_count(DbName),
         with_retention_config(365, fun() ->

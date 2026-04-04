@@ -700,10 +700,13 @@ get_db_sizes(DbName) ->
 
 get_changes_since(DbName, Since) ->
     couch_util:with_db(DbName, fun(Db) ->
-        Fun = fun(#doc_info{id = Id, high_seq = Seq}, Acc) ->
-            {ok, [{Id, Seq} | Acc]}
+        Fun = fun
+            (#full_doc_info{id = Id, update_seq = Seq}, Acc) ->
+                {ok, [{Id, Seq} | Acc]};
+            (#doc_info{id = Id, high_seq = Seq}, Acc) ->
+                {ok, [{Id, Seq} | Acc]}
         end,
-        {ok, Changes} = couch_db:changes_since(Db, Since, Fun, [], []),
+        {ok, Changes} = couch_db:fold_changes(Db, Since, Fun, []),
         lists:reverse(Changes)
     end).
 
