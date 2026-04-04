@@ -74,8 +74,15 @@
 
 # Increase distribution buffer size from default of 1MB to 32MB. The default is
 # usually a bit low on busy clusters. Has no effect for single-node setups.
-# The unit is in kilobytes.
+# The unit is in kilobytes. For multi-DC deployments, consider 65536 (64MB).
 +zdbbl 32768
+
+# Net tick time: how often Erlang checks if connected nodes are alive.
+# Default is 60s (4 ticks at 15s each). For multi-DC deployments, set to
+# 30s to tolerate WAN latency while still detecting failures reasonably fast.
+# Too low = spurious disconnections during GC pauses on cross-DC links.
+# Too high = slow failure detection.
+-kernel net_ticktime 30
 
 # When running on Docker, Kubernetes or an OS using CFS (Completely Fair
 # Scheduler) with CPU quota limits set, disable busy waiting for schedulers to

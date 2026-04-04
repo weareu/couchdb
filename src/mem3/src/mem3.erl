@@ -46,7 +46,17 @@
 
 -include_lib("mem3/include/mem3.hrl").
 
+%% Default ping timeout. For same-zone nodes, use a shorter timeout
+%% to detect failures faster. For cross-zone nodes, use the full
+%% timeout to tolerate WAN latency.
+%%
+%% Config:
+%%   [cluster]
+%%   same_zone_ping_timeout_ms = 10000
+%%   cross_zone_ping_timeout_ms = 60000
+%%
 -define(PING_TIMEOUT_IN_MS, 60000).
+-define(SAME_ZONE_PING_TIMEOUT_MS, 10000).
 
 start() ->
     application:start(mem3).
@@ -438,7 +448,21 @@ ping(Node, Timeout) when is_atom(Node) ->
 -spec ping_nodes() -> [{node(), pos_integer() | Error :: term()}].
 
 ping_nodes() ->
-    ping_nodes(live_cluster_nodes(), ?PING_TIMEOUT_IN_MS).
+    %% Use zone-aware timeouts: shorter for same-zone (fast failure
+    %% detection), longer for cross-zone (tolerate WAN latency).
+    Nodes = live_cluster_nodes(),
+    SameZoneTimeout = config:get_integer(
+        "cluster", "same_zone_ping_timeout_ms", ?SAME_ZONE_PING_TIMEOUT_MS),
+    CrossZoneTimeout = config:get_integer(
+        "cluster", "cross_zone_ping_timeout_ms", ?PING_TIMEOUT_IN_MS),
+    LocalZone = node_info(config:node_name(), <<"zone">>),
+    {SameZoneNodes, CrossZoneNodes} = lists:partition(
+        fun(N) -> node_info(N, <<"zone">>) =:= LocalZone end,
+        Nodes
+    ),
+    SameResults = ping_nodes(SameZoneNodes, SameZoneTimeout),
+    CrossResults = ping_nodes(CrossZoneNodes, CrossZoneTimeout),
+    lists:sort(SameResults ++ CrossResults).
 
 -spec ping_nodes(Timeout :: pos_integer()) -> [{node(), pos_integer() | Error :: term()}].
 
