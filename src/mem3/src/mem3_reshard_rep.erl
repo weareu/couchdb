@@ -360,9 +360,9 @@ run_split(#split_state{state = topoff_1} = St) ->
     end;
 
 run_split(#split_state{state = building_indices} = St) ->
-    couch_log:notice("mem3_reshard_rep: building indices on targets", []),
-    %% Index building is best-effort at this stage — indices will be
-    %% built on demand if this fails
+    couch_log:notice("mem3_reshard_rep: warming up view indices on targets", []),
+    %% Proactive index warm-up. Not required — indices build on demand.
+    %% But warming up now means the first query after split is fast.
     build_indices(St#split_state.targets),
     run_split(St#split_state{state = topoff_2});
 
@@ -676,17 +676,11 @@ verify_update_seqs(SourceName, TargetNames) ->
         _ -> {error, {update_seq_problems, Problems}}
     end.
 
-%% @doc Build view indices on target shards.
-%%
-%% Only rebuilds couch_mrview (MapReduce) indices. Other index types:
-%%   - Nouveau (Lucene search): rebuilds automatically on first query.
-%%     Index is keyed by shard name — new shards get new indices.
-%%   - Dreyfus (Clouseau search): same as nouveau — rebuilds on demand.
-%%   - Mango (_index): stored as design docs, transfer via replication.
-%%     The actual index files rebuild on first query.
-%%
-%% Old indices for the deleted source shard become orphaned and are
-%% cleaned up by their respective garbage collection mechanisms.
+%% @doc Proactive view index warm-up on target shards.
+%% The data is already there (replicated). This just triggers mrview
+%% to build its index so the first query after split is fast.
+%% All index types (mrview, nouveau, mango, dreyfus) build on demand —
+%% this step is an optimization, not a requirement.
 build_indices(Targets) ->
     UniqueTargets = unique_range_targets(Targets),
     lists:foreach(fun(#shard{name = Name}) ->
