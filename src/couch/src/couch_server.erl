@@ -310,7 +310,9 @@ init([N]) ->
             update_upgrade_in_progress_gauge(),
             % Spawn async .deleted files recursive cleaner, but only
             % for the first sharded couch_server instance
-            ok = couch_file:init_delete_dir(RootDir);
+            ok = couch_file:init_delete_dir(RootDir),
+            % Initialize multi-directory support (scans existing files)
+            couch_multidir:init();
         _ ->
             ok
     end,
@@ -426,7 +428,10 @@ all_databases() ->
 
 all_databases(Fun, Acc0) ->
     {ok, #server{root_dir = Root}} = gen_server:call(couch_server_1, get_server),
-    NormRoot = couch_util:normpath(Root),
+    Roots = case couch_multidir:is_enabled() of
+        true -> lists:usort([Root | couch_multidir:all_dirs()]);
+        false -> [Root]
+    end,
     Extensions = get_engine_extensions(),
     ExtRegExp = "(" ++ string:join(Extensions, "|") ++ ")",
     RegExp =
@@ -438,25 +443,28 @@ all_databases(Fun, Acc0) ->
         "\\." ++ ExtRegExp ++ "$",
     FinalAcc =
         try
-            couch_util:fold_files(
-                Root,
-                RegExp,
-                true,
-                fun(Filename, AccIn) ->
-                    NormFilename = couch_util:normpath(Filename),
-                    RelativeFilename =
-                        case NormFilename -- NormRoot of
-                            [$/ | FName] -> FName;
-                            FName -> FName
-                        end,
-                    Ext = filename:extension(RelativeFilename),
-                    case Fun(?l2b(filename:rootname(RelativeFilename, Ext)), AccIn) of
-                        {ok, NewAcc} -> NewAcc;
-                        {stop, NewAcc} -> throw({stop, Fun, NewAcc})
-                    end
-                end,
-                Acc0
-            )
+            lists:foldl(fun(RootDir, AccOuter) ->
+                NormRoot = couch_util:normpath(RootDir),
+                couch_util:fold_files(
+                    RootDir,
+                    RegExp,
+                    true,
+                    fun(Filename, AccIn) ->
+                        NormFilename = couch_util:normpath(Filename),
+                        RelativeFilename =
+                            case NormFilename -- NormRoot of
+                                [$/ | FName] -> FName;
+                                FName -> FName
+                            end,
+                        Ext = filename:extension(RelativeFilename),
+                        case Fun(?l2b(filename:rootname(RelativeFilename, Ext)), AccIn) of
+                            {ok, NewAcc} -> NewAcc;
+                            {stop, NewAcc} -> throw({stop, Fun, NewAcc})
+                        end
+                    end,
+                    AccOuter
+                )
+            end, Acc0, Roots)
         catch
             throw:{stop, Fun, Acc1} ->
                 Acc1
@@ -919,7 +927,12 @@ make_filepath(RootDir, DbName, Extension) when is_binary(DbName) ->
 make_filepath(RootDir, DbName, Extension) when is_binary(Extension) ->
     make_filepath(RootDir, DbName, binary_to_list(Extension));
 make_filepath(RootDir, DbName, Extension) ->
-    filename:join([RootDir, "./" ++ DbName ++ "." ++ Extension]).
+    case couch_multidir:is_enabled() of
+        true ->
+            couch_multidir:resolve(RootDir, DbName, Extension);
+        false ->
+            filename:join([RootDir, "./" ++ DbName ++ "." ++ Extension])
+    end.
 
 get_engine_extensions() ->
     case config:get("couchdb_engines") of
