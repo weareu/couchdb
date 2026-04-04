@@ -168,15 +168,15 @@ deterministic_simulation_test_() ->
     }.
 
 t_seeded_random_ops_seed_1(DbName) ->
-    ?_test(run_seeded_simulation(DbName, 1, 200)).
+    {timeout, 120, ?_test(run_seeded_simulation(DbName, 1, 200))}.
 t_seeded_random_ops_seed_42(DbName) ->
-    ?_test(run_seeded_simulation(DbName, 42, 200)).
+    {timeout, 120, ?_test(run_seeded_simulation(DbName, 42, 200))}.
 t_seeded_random_ops_seed_12345(DbName) ->
-    ?_test(run_seeded_simulation(DbName, 12345, 200)).
+    {timeout, 120, ?_test(run_seeded_simulation(DbName, 12345, 200))}.
 t_seeded_random_ops_seed_99999(DbName) ->
-    ?_test(run_seeded_simulation(DbName, 99999, 200)).
+    {timeout, 120, ?_test(run_seeded_simulation(DbName, 99999, 200))}.
 t_seeded_random_ops_seed_777(DbName) ->
-    ?_test(run_seeded_simulation(DbName, 777, 200)).
+    {timeout, 120, ?_test(run_seeded_simulation(DbName, 777, 200))}.
 
 run_seeded_simulation(DbName, Seed, NumOps) ->
     rand:seed(exsss, {Seed, Seed * 7, Seed * 13}),

@@ -30,6 +30,9 @@
 
 setup() ->
     {ok, Apps} = application:ensure_all_started(config),
+    % Stop any leftover instance from a previous test group
+    catch gen_server:stop(mem3_circuit_breaker, normal, 1000),
+    timer:sleep(10),
     {ok, Pid} = mem3_circuit_breaker:start_link(),
     % Set tight values for testing
     ok = config:set("circuit_breaker", "recovery_wait_ms", "100", false),
@@ -41,8 +44,11 @@ setup() ->
 
 teardown({Pid, _Apps}) ->
     unlink(Pid),
+    Ref = monitor(process, Pid),
     exit(Pid, kill),
-    ok.
+    receive {'DOWN', Ref, process, Pid, _} -> ok
+    after 1000 -> ok
+    end.
 
 %% ===================================================================
 %% Core state machine

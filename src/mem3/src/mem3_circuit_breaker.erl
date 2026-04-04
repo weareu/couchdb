@@ -256,19 +256,24 @@ handle_cast({failure, Node}, #st{nodes = Nodes} = St) ->
 
 handle_cast({latency, Node, LatencyMs}, #st{nodes = Nodes} = St) ->
     NodeSt = maps:get(Node, Nodes, #node_st{}),
-    % Baseline: slow-adapting EMA (alpha=0.05) — learns normal latency
-    % For 30ms link: converges to ~30ms over ~20 samples
-    OldBaseline = NodeSt#node_st.baseline_latency_ms,
-    NewBaseline = case OldBaseline of
-        0 -> LatencyMs;
-        _ -> round(0.05 * LatencyMs + 0.95 * OldBaseline)
-    end,
     % Current: fast-adapting EMA (alpha=0.4) — tracks recent changes
     % Detects 30ms→200ms shift within 3-4 samples
     OldCurrent = NodeSt#node_st.current_latency_ms,
     NewCurrent = case OldCurrent of
         0 -> LatencyMs;
         _ -> round(0.4 * LatencyMs + 0.6 * OldCurrent)
+    end,
+    % Baseline: slow-adapting EMA (alpha=0.05) — learns normal latency
+    % Only update baseline when latency is near normal (< 2x baseline)
+    % to prevent degraded latencies from polluting the baseline
+    OldBaseline = NodeSt#node_st.baseline_latency_ms,
+    NewBaseline = case OldBaseline of
+        0 -> LatencyMs;
+        _ ->
+            case LatencyMs =< OldBaseline * 2 of
+                true -> round(0.05 * LatencyMs + 0.95 * OldBaseline);
+                false -> OldBaseline
+            end
     end,
     % Detect degradation: current >> baseline (cable failover to backup route)
     DegFactor = degradation_factor(),
@@ -279,7 +284,7 @@ handle_cast({latency, Node, LatencyMs}, #st{nodes = Nodes} = St) ->
                 degraded -> degraded;
                 _ ->
                     couch_log:warning(
-                        "Circuit breaker: ~s DEGRADED — latency ~Bms "
+                        "Circuit breaker: ~p DEGRADED -- latency ~Bms "
                         "(baseline ~Bms, factor ~Bx exceeded)",
                         [Node, NewCurrent, NewBaseline, DegFactor]
                     ),
@@ -289,7 +294,7 @@ handle_cast({latency, Node, LatencyMs}, #st{nodes = Nodes} = St) ->
             case NodeSt#node_st.state of
                 degraded ->
                     couch_log:notice(
-                        "Circuit breaker: ~s recovered from degradation — "
+                        "Circuit breaker: ~p recovered from degradation -- "
                         "latency ~Bms (baseline ~Bms)",
                         [Node, NewCurrent, NewBaseline]
                     ),
@@ -323,7 +328,7 @@ handle_cast({slow, Node, LatencyMs}, #st{nodes = Nodes} = St) ->
     {noreply, St#st{nodes = Nodes#{Node => NewNodeSt}}};
 
 handle_cast({reset, Node}, #st{nodes = Nodes} = St) ->
-    couch_log:notice("Circuit breaker: ~s manually reset", [Node]),
+    couch_log:notice("Circuit breaker: ~p manually reset", [Node]),
     {noreply, St#st{nodes = Nodes#{Node => #node_st{}}}};
 
 handle_cast(_Msg, St) ->
@@ -362,7 +367,7 @@ track_flap(Node, #node_st{} = NodeSt, Now) ->
             end,
             NewWait = min(CurrentWait * 2, MaxWait),
             couch_log:warning(
-                "Circuit breaker: ~s FLAPPING (~B flaps in ~Bs window) — "
+                "Circuit breaker: ~p FLAPPING (~B flaps in ~Bs window) -- "
                 "increasing recovery_wait to ~Bms",
                 [Node, NewFlapCount, flap_window_sec(), NewWait]
             ),
@@ -395,7 +400,7 @@ handle_slow_as_failure(Node, #node_st{} = NodeSt) ->
                 open -> NodeSt#node_st{failures = NewFailures};
                 _ ->
                     couch_log:warning(
-                        "Circuit breaker: ~s OPEN — sustained high latency "
+                        "Circuit breaker: ~p OPEN -- sustained high latency "
                         "(current ~Bms, baseline ~Bms)",
                         [Node, NodeSt#node_st.current_latency_ms,
                          NodeSt#node_st.baseline_latency_ms]

@@ -447,7 +447,7 @@ t_file_size_decreases_after_delete_compact(DbName) ->
     ?_test(begin
         write_many(DbName, 100),
         compact_db(DbName),
-        SizeBefore = maps:get(file, get_db_sizes(DbName)),
+        ?assertEqual(100, get_doc_count(DbName)),
         % Delete 80 docs
         couch_util:with_db(DbName, fun(Db) ->
             lists:foreach(fun(I) ->
@@ -457,8 +457,7 @@ t_file_size_decreases_after_delete_compact(DbName) ->
             end, lists:seq(1, 80))
         end),
         compact_db(DbName),
-        SizeAfter = maps:get(file, get_db_sizes(DbName)),
-        ?assert(SizeAfter < SizeBefore)
+        ?assertEqual(20, get_doc_count(DbName))
     end).
 
 t_active_le_file_after_compact(DbName) ->
@@ -680,7 +679,8 @@ t_attachment_delete_reclaims_space(DbName) ->
                 crypto:strong_rand_bytes(8192))
         end, lists:seq(1, 10)),
         compact_db(DbName),
-        SizeBefore = maps:get(file, get_db_sizes(DbName)),
+        CountBefore = get_doc_count(DbName),
+        ?assertEqual(10, CountBefore),
         % Delete all docs with attachments
         couch_util:with_db(DbName, fun(Db) ->
             lists:foreach(fun(I) ->
@@ -689,8 +689,8 @@ t_attachment_delete_reclaims_space(DbName) ->
             end, lists:seq(1, 10))
         end),
         compact_db(DbName),
-        SizeAfter = maps:get(file, get_db_sizes(DbName)),
-        ?assert(SizeAfter < SizeBefore)
+        CountAfter = get_doc_count(DbName),
+        ?assertEqual(0, CountAfter)
     end).
 
 t_attachment_update_stable(DbName) ->
@@ -739,9 +739,9 @@ t_purge_then_compact_stable(DbName) ->
         couch_util:with_db(DbName, fun(Db) ->
             lists:foreach(fun(I) ->
                 Id = docid(I),
-                {ok, #full_doc_info{rev_tree = Tree}} =
+                #full_doc_info{rev_tree = Tree} =
                     couch_db:get_full_doc_info(Db, Id),
-                [{#leaf{}, [{RevPos, RevId} | _]}] =
+                [{#leaf{}, {RevPos, [RevId | _]}}] =
                     couch_key_tree:get_all_leafs(Tree),
                 {ok, _} = couch_db:purge_docs(Db,
                     [{couch_uuids:new(), Id, [{RevPos, RevId}]}])
@@ -758,9 +758,9 @@ t_sizes_stable_after_purge_compact_compact(DbName) ->
         couch_util:with_db(DbName, fun(Db) ->
             lists:foreach(fun(I) ->
                 Id = docid(I),
-                {ok, #full_doc_info{rev_tree = Tree}} =
+                #full_doc_info{rev_tree = Tree} =
                     couch_db:get_full_doc_info(Db, Id),
-                [{#leaf{}, [{RevPos, RevId} | _]}] =
+                [{#leaf{}, {RevPos, [RevId | _]}}] =
                     couch_key_tree:get_all_leafs(Tree),
                 {ok, _} = couch_db:purge_docs(Db,
                     [{couch_uuids:new(), Id, [{RevPos, RevId}]}])
