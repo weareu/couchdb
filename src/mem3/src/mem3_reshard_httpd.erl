@@ -243,12 +243,14 @@ handle_reshard_req(#httpd{path_parts = [_, ?JOBS, _, ?STATE]} = Req) ->
 
 % GET /_reshard/auto — status
 handle_reshard_req(#httpd{method = 'GET', path_parts = [_, <<"auto">>]} = Req) ->
+    chttpd:verify_is_server_admin(Req),
     Status = mem3_auto_shard:status(),
     send_json(Req, {maps:to_list(Status)});
 % PUT /_reshard/auto — update config
 handle_reshard_req(
     #httpd{method = 'PUT', path_parts = [_, <<"auto">>]} = Req
 ) ->
+    chttpd:verify_is_server_admin(Req),
     couch_httpd:validate_ctype(Req, "application/json"),
     {Props} = couch_httpd:json_body_obj(Req),
     apply_auto_config(Props),
@@ -257,18 +259,21 @@ handle_reshard_req(
 handle_reshard_req(
     #httpd{method = 'POST', path_parts = [_, <<"auto">>, <<"scan">>]} = Req
 ) ->
+    chttpd:verify_is_server_admin(Req),
     mem3_auto_shard:trigger_scan(),
     send_json(Req, 202, {[{ok, true}]});
 % POST /_reshard/auto/pause
 handle_reshard_req(
     #httpd{method = 'POST', path_parts = [_, <<"auto">>, <<"pause">>]} = Req
 ) ->
+    chttpd:verify_is_server_admin(Req),
     mem3_auto_shard:pause(),
     send_json(Req, {[{ok, true}]});
 % POST /_reshard/auto/resume
 handle_reshard_req(
     #httpd{method = 'POST', path_parts = [_, <<"auto">>, <<"resume">>]} = Req
 ) ->
+    chttpd:verify_is_server_admin(Req),
     mem3_auto_shard:resume(),
     send_json(Req, {[{ok, true}]});
 handle_reshard_req(#httpd{path_parts = [_, <<"auto">> | _]} = Req) ->

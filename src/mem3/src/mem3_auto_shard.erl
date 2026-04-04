@@ -178,7 +178,8 @@ do_scan(State) ->
         false ->
             State;
         true ->
-            State1 = State#state{scan_count = State#state.scan_count + 1},
+            State1 = prune_cooldowns(
+                State#state{scan_count = State#state.scan_count + 1}),
             Oversized = mem3_shard_size:get_sizes_over(
                 State1#state.max_shard_size_bytes),
             Candidates = filter_candidates(Oversized, State1),
@@ -451,11 +452,12 @@ load_config(State) ->
 
 parse_maintenance_window("always") -> always;
 parse_maintenance_window(Str) ->
+    %% Format: "HH-HH" or "HH:MM-HH:MM" (only hours used)
     case string:tokens(Str, "-") of
         [StartStr, EndStr] ->
             try
-                Start = list_to_integer(string:trim(StartStr, both, ":")),
-                End = list_to_integer(string:trim(EndStr, both, ":")),
+                Start = parse_hour(string:trim(StartStr)),
+                End = parse_hour(string:trim(EndStr)),
                 {Start, End}
             catch
                 _:_ -> always
@@ -463,6 +465,16 @@ parse_maintenance_window(Str) ->
         _ ->
             always
     end.
+
+parse_hour(Str) ->
+    %% Accept "22", "22:00", "2:00"
+    HourStr = case string:tokens(Str, ":") of
+        [Hr | _] -> Hr;
+        _ -> Str
+    end,
+    Hour = list_to_integer(HourStr),
+    true = (Hour >= 0 andalso Hour =< 23),
+    Hour.
 
 parse_db_list(undefined) -> [];
 parse_db_list("") -> [];
@@ -481,6 +493,13 @@ schedule_scan(#state{timer_ref = OldRef} = State) ->
 
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
+
+prune_cooldowns(#state{cooldowns = Cooldowns, cooldown_ms = CooldownMs} = State) ->
+    Now = erlang:system_time(millisecond),
+    Pruned = maps:filter(fun(_DbName, LastSplit) ->
+        (Now - LastSplit) < CooldownMs
+    end, Cooldowns),
+    State#state{cooldowns = Pruned}.
 
 %% ===================================================================
 %% Glob matching

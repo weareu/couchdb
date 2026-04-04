@@ -225,9 +225,23 @@ scan_dir(Dir, Extensions) ->
             fun(FilePath, ok) ->
                 NormDir = couch_util:normpath(Dir),
                 NormFile = couch_util:normpath(FilePath),
-                RelPath = case NormFile -- NormDir of
-                    [$/ | Rel] -> Rel;
-                    Rel -> Rel
+                %% Proper prefix stripping (not bag subtraction)
+                NormDirSlash = case lists:last(NormDir) of
+                    $/ -> NormDir;
+                    _ -> NormDir ++ "/"
+                end,
+                RelPath = case lists:prefix(NormDirSlash, NormFile) of
+                    true -> lists:nthtail(length(NormDirSlash), NormFile);
+                    false ->
+                        case lists:prefix(NormDir, NormFile) of
+                            true ->
+                                Tail = lists:nthtail(length(NormDir), NormFile),
+                                case Tail of
+                                    [$/ | R] -> R;
+                                    R -> R
+                                end;
+                            false -> NormFile
+                        end
                 end,
                 Ext = filename:extension(RelPath),
                 DbName = list_to_binary(filename:rootname(RelPath, Ext)),

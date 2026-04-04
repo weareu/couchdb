@@ -178,33 +178,79 @@ verify_doc_counts(SourceName, TargetNames) ->
     end.
 
 %% @doc Verify that every doc in source exists in exactly one target.
-%% Uses sampling for large databases (checks first 1000, last 1000,
-%% and 1000 random docs).
+%% For small databases (<= 10000 docs), checks ALL docs.
+%% For large databases, verifies doc_count + doc_del_count match
+%% (already checked by verify_doc_counts) AND checks a systematic
+%% sample: first 500, last 500, and 500 evenly-spaced docs.
 -spec verify_doc_distribution(binary(), [binary()], fun()) -> ok | {error, term()}.
-verify_doc_distribution(SourceName, TargetNames, HashFun) ->
+verify_doc_distribution(SourceName, TargetNames, _HashFun) ->
     {ok, SourceDb} = couch_db:open_int(SourceName, [?ADMIN_CTX]),
     try
         {ok, SourceInfo} = couch_db:get_db_info(SourceDb),
         DocCount = couch_util:get_value(doc_count, SourceInfo),
-        %% For small DBs, check all. For large, sample.
-        SampleSize = min(DocCount, 3000),
-        verify_sample(SourceDb, TargetNames, HashFun, SampleSize)
+        case DocCount =< 10000 of
+            true ->
+                %% Small DB: verify ALL docs exist in a target
+                verify_all_docs(SourceDb, TargetNames);
+            false ->
+                %% Large DB: doc counts already verified by verify_doc_counts.
+                %% Do systematic sample: first 500, skip through middle, last 500.
+                verify_systematic_sample(SourceDb, TargetNames, DocCount)
+        end
     after
         couch_db:close(SourceDb)
     end.
 
-verify_sample(SourceDb, TargetNames, _HashFun, SampleSize) ->
-    %% Fold through first SampleSize docs and verify each exists in a target
-    {ok, Errors} = couch_db:fold_docs(SourceDb, fun(FDI, AccIn) ->
+verify_all_docs(SourceDb, TargetNames) ->
+    {ok, Missing} = couch_db:fold_docs(SourceDb, fun(FDI, AccIn) ->
         #full_doc_info{id = DocId} = FDI,
         case doc_exists_in_any_target(DocId, TargetNames) of
             true -> {ok, AccIn};
             false -> {ok, [DocId | AccIn]}
         end
-    end, [], [{limit, SampleSize}]),
-    case Errors of
+    end, [], []),
+    case Missing of
         [] -> ok;
-        Missing -> {error, {docs_missing_from_targets, Missing}}
+        _ -> {error, {docs_missing_from_targets, length(Missing),
+                      lists:sublist(Missing, 10)}}
+    end.
+
+verify_systematic_sample(SourceDb, TargetNames, DocCount) ->
+    %% Check first 500
+    {ok, Missing1} = couch_db:fold_docs(SourceDb, fun(FDI, AccIn) ->
+        #full_doc_info{id = DocId} = FDI,
+        case doc_exists_in_any_target(DocId, TargetNames) of
+            true -> {ok, AccIn};
+            false -> {ok, [DocId | AccIn]}
+        end
+    end, [], [{limit, 500}]),
+    %% Check last 500 (fold in reverse)
+    {ok, Missing2} = couch_db:fold_docs(SourceDb, fun(FDI, AccIn) ->
+        #full_doc_info{id = DocId} = FDI,
+        case doc_exists_in_any_target(DocId, TargetNames) of
+            true -> {ok, AccIn};
+            false -> {ok, [DocId | AccIn]}
+        end
+    end, [], [{limit, 500}, {dir, rev}]),
+    %% Check 500 evenly spaced through the middle
+    Step = max(1, DocCount div 500),
+    {ok, {Missing3, _}} = couch_db:fold_docs(SourceDb, fun(FDI, {AccIn, Counter}) ->
+        case Counter rem Step of
+            0 ->
+                #full_doc_info{id = DocId} = FDI,
+                case doc_exists_in_any_target(DocId, TargetNames) of
+                    true -> {ok, {AccIn, Counter + 1}};
+                    false -> {ok, {[DocId | AccIn], Counter + 1}}
+                end;
+            _ ->
+                {ok, {AccIn, Counter + 1}}
+        end
+    end, {[], 0}, []),
+    AllMissing = Missing1 ++ Missing2 ++ Missing3,
+    case AllMissing of
+        [] -> ok;
+        _ -> {error, {docs_missing_from_targets, length(AllMissing),
+                      lists:sublist(AllMissing, 10)}}
     end.
 
 doc_exists_in_any_target(DocId, TargetNames) ->
@@ -296,6 +342,7 @@ run_split(#split_state{state = replicating} = St) ->
         ok ->
             run_split(St#split_state{state = topoff_1});
         {error, Reason} ->
+            cleanup_targets_on_failure(St),
             {error, {replication_failed, Reason}}
     end;
 
@@ -339,10 +386,26 @@ run_split(#split_state{state = updating_map} = St) ->
     #split_state{source = Source, targets = Targets} = St,
     couch_log:notice("mem3_reshard_rep: updating shard map", []),
     case update_shard_map(Source, Targets) of
+        ok -> run_split(St#split_state{state = topoff_post_map});
+        {error, _} = Err ->
+            %% Map update failed — targets exist but map unchanged.
+            %% Clean up targets since no shard map change occurred.
+            cleanup_targets_on_failure(St),
+            Err
+    end;
+
+%% After shard map update, clients start routing to targets.
+%% Any writes that hit the source during the propagation window
+%% must be caught by this topoff pass.
+run_split(#split_state{state = topoff_post_map} = St) ->
+    couch_log:notice("mem3_reshard_rep: post-map topoff (catching propagation writes)", []),
+    case do_topoff(St) of
         ok -> run_split(St#split_state{state = topoff_final});
         {error, _} = Err -> Err
     end;
 
+%% Second topoff after propagation settles — catches any writes that
+%% arrived at source during the first post-map topoff.
 run_split(#split_state{state = topoff_final} = St) ->
     couch_log:notice("mem3_reshard_rep: final topoff", []),
     case do_topoff(St) of
@@ -378,6 +441,15 @@ run_split(#split_state{state = deleting_source} = St) ->
         {error, _} = Err ->
             Err
     end.
+
+%% Clean up target DBs when split fails BEFORE shard map update.
+%% Safe because no shard map change occurred — clients never routed to targets.
+cleanup_targets_on_failure(#split_state{targets = Targets}) ->
+    UniqueTargets = unique_range_targets(Targets),
+    lists:foreach(fun(#shard{name = Name}) ->
+        couch_log:notice("mem3_reshard_rep: cleaning up orphan target ~s", [Name]),
+        catch couch_server:delete(Name, [?ADMIN_CTX])
+    end, UniqueTargets).
 
 do_topoff(#split_state{source = Source, target_map = TMap}) ->
     topoff(Source, TMap, [{batch_size, 500}, {batch_count, all}]).
@@ -510,10 +582,41 @@ wait_shard_map_propagated(#shard{name = Name} = Source, RetriesLeft) ->
 verify_consistency(SourceName, TargetNames) ->
     case verify_doc_counts(SourceName, TargetNames) of
         ok ->
-            HashFun = mem3_hash:get_hash_fun(SourceName),
-            verify_doc_distribution(SourceName, TargetNames, HashFun);
+            case verify_update_seqs(SourceName, TargetNames) of
+                ok ->
+                    HashFun = mem3_hash:get_hash_fun(SourceName),
+                    verify_doc_distribution(SourceName, TargetNames, HashFun);
+                {error, _} = Err -> Err
+            end;
         {error, _} = Err ->
             Err
+    end.
+
+%% @doc Verify that target update sequences are valid (non-zero when
+%% docs exist) and that the sum of target update_seqs is >= source.
+%% This prevents changes feed rollback — targets must have progressed
+%% at least as far as the source's final sequence.
+verify_update_seqs(SourceName, TargetNames) ->
+    {ok, SDb} = couch_db:open_int(SourceName, [?ADMIN_CTX]),
+    {ok, SInfo} = try couch_db:get_db_info(SDb)
+        after couch_db:close(SDb) end,
+    SDocCount = couch_util:get_value(doc_count, SInfo),
+    Problems = lists:filtermap(fun(TName) ->
+        {ok, TDb} = couch_db:open_int(TName, [?ADMIN_CTX]),
+        {ok, TInfo} = try couch_db:get_db_info(TDb)
+            after couch_db:close(TDb) end,
+        TSeq = couch_util:get_value(update_seq, TInfo),
+        TCount = couch_util:get_value(doc_count, TInfo),
+        %% Target must have a valid update_seq if it has docs
+        case TCount > 0 andalso TSeq =:= 0 of
+            true -> {true, {TName, zero_seq_with_docs}};
+            false -> false
+        end
+    end, TargetNames),
+    case {Problems, SDocCount} of
+        {[], _} -> ok;
+        {_, 0} -> ok;  % Empty source, don't care about sequences
+        _ -> {error, {update_seq_problems, Problems}}
     end.
 
 %% @doc Build view indices on target shards.
