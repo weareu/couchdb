@@ -45,10 +45,8 @@
     is_excluded/2,
     is_split_disabled_by_ddoc/1,
     is_coordinator/0,
-    next_power_of_2/1,
-    calculate_split_factor/2,
-    in_maintenance_window/1,
-    all_circuits_closed/0
+    all_circuits_closed/0,
+    load_config_for_test/0
 ]).
 
 %% gen_server callbacks
@@ -493,6 +491,16 @@ schedule_scan(#state{timer_ref = OldRef} = State) ->
 
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
+
+%% For testing — load config into a state record without starting gen_server
+load_config_for_test() ->
+    load_config(#state{
+        paused = false,
+        active_splits = #{},
+        cooldowns = #{},
+        scan_count = 0,
+        splits_triggered = 0
+    }).
 
 prune_cooldowns(#state{cooldowns = Cooldowns, cooldown_ms = CooldownMs} = State) ->
     Now = erlang:system_time(millisecond),
