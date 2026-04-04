@@ -42,13 +42,30 @@
 -include_lib("couch/include/couch_db.hrl").
 
 -export([
+    split/3,
     subdivide_range/2,
     build_targets/3,
     build_target_map/1,
+    create_target_dbs/1,
+    replicate/3,
+    topoff/3,
+    copy_local_docs/2,
+    update_shard_map/2,
+    verify_consistency/2,
     verify_doc_counts/2,
     verify_doc_distribution/3,
-    preflight_check/3
+    preflight_check/3,
+    delete_source/1
 ]).
+
+-record(split_state, {
+    source :: #shard{},
+    targets :: [#shard{}],
+    target_map :: #{},
+    factor :: pos_integer(),
+    state :: atom(),
+    error :: term() | undefined
+}).
 
 %% ===================================================================
 %% Range subdivision
@@ -64,7 +81,7 @@ subdivide_range([Begin, End], Factor) when
 ->
     Width = End - Begin + 1,
     TargetWidth = Width div Factor,
-    Rem = Width rem Factor,
+    _Rem = Width rem Factor,
     Ranges = lists:map(fun(I) ->
         B = Begin + (I * TargetWidth),
         E = case I =:= Factor - 1 of
@@ -233,6 +250,310 @@ preflight_check(SourceSizeBytes, Factor, NodeCapacities) ->
         [] -> ok;
         _ -> {error, {insufficient_space, Problems}}
     end.
+
+%% ===================================================================
+%% Split orchestrator
+%% ===================================================================
+
+%% @doc Split a shard into Factor pieces, placing targets on TargetNodes.
+%% This is the main entry point. Runs synchronously — call from a
+%% worker process. Returns ok or {error, Reason}.
+%%
+%% The function is designed to be resumable: if it crashes, the caller
+%% can retry. mem3_rep checkpoints handle resume of the replication
+%% phases. Target DBs that already exist are not re-created.
+-spec split(#shard{}, pos_integer(), [node()]) -> ok | {error, term()}.
+split(#shard{} = Source, Factor, TargetNodes) when
+    is_integer(Factor), Factor >= 2, is_list(TargetNodes), TargetNodes =/= []
+->
+    couch_log:notice("mem3_reshard_rep: starting ~B-way split of ~s",
+        [Factor, Source#shard.name]),
+    Targets = build_targets(Source, Factor, TargetNodes),
+    TMap = build_target_map(Targets),
+    St = #split_state{
+        source = Source,
+        targets = Targets,
+        target_map = TMap,
+        factor = Factor,
+        state = creating_targets
+    },
+    run_split(St).
+
+run_split(#split_state{state = creating_targets} = St) ->
+    #split_state{targets = Targets} = St,
+    couch_log:notice("mem3_reshard_rep: creating ~B target DBs", [length(Targets)]),
+    case create_target_dbs(Targets) of
+        ok ->
+            run_split(St#split_state{state = replicating});
+        {error, Reason} ->
+            {error, {creating_targets_failed, Reason}}
+    end;
+
+run_split(#split_state{state = replicating} = St) ->
+    #split_state{source = Source, target_map = TMap} = St,
+    couch_log:notice("mem3_reshard_rep: bulk replication from ~s", [Source#shard.name]),
+    case replicate(Source, TMap, [{batch_size, 1000}, {batch_count, all}]) of
+        ok ->
+            run_split(St#split_state{state = topoff_1});
+        {error, Reason} ->
+            {error, {replication_failed, Reason}}
+    end;
+
+run_split(#split_state{state = topoff_1} = St) ->
+    couch_log:notice("mem3_reshard_rep: topoff 1", []),
+    case do_topoff(St) of
+        ok -> run_split(St#split_state{state = building_indices});
+        {error, _} = Err -> Err
+    end;
+
+run_split(#split_state{state = building_indices} = St) ->
+    couch_log:notice("mem3_reshard_rep: building indices on targets", []),
+    %% Index building is best-effort at this stage — indices will be
+    %% built on demand if this fails
+    build_indices(St#split_state.targets),
+    run_split(St#split_state{state = topoff_2});
+
+run_split(#split_state{state = topoff_2} = St) ->
+    couch_log:notice("mem3_reshard_rep: topoff 2", []),
+    case do_topoff(St) of
+        ok -> run_split(St#split_state{state = copying_local});
+        {error, _} = Err -> Err
+    end;
+
+run_split(#split_state{state = copying_local} = St) ->
+    #split_state{source = Source, target_map = TMap} = St,
+    couch_log:notice("mem3_reshard_rep: copying local docs", []),
+    case copy_local_docs(Source, TMap) of
+        ok -> run_split(St#split_state{state = topoff_3});
+        {error, _} = Err -> Err
+    end;
+
+run_split(#split_state{state = topoff_3} = St) ->
+    couch_log:notice("mem3_reshard_rep: topoff 3", []),
+    case do_topoff(St) of
+        ok -> run_split(St#split_state{state = updating_map});
+        {error, _} = Err -> Err
+    end;
+
+run_split(#split_state{state = updating_map} = St) ->
+    #split_state{source = Source, targets = Targets} = St,
+    couch_log:notice("mem3_reshard_rep: updating shard map", []),
+    case update_shard_map(Source, Targets) of
+        ok -> run_split(St#split_state{state = topoff_final});
+        {error, _} = Err -> Err
+    end;
+
+run_split(#split_state{state = topoff_final} = St) ->
+    couch_log:notice("mem3_reshard_rep: final topoff", []),
+    case do_topoff(St) of
+        ok -> run_split(St#split_state{state = verifying});
+        {error, _} = Err -> Err
+    end;
+
+run_split(#split_state{state = verifying} = St) ->
+    #split_state{source = Source, targets = Targets} = St,
+    couch_log:notice("mem3_reshard_rep: verifying consistency", []),
+    TargetNames = [T#shard.name || T <- unique_range_targets(Targets)],
+    case verify_consistency(Source#shard.name, TargetNames) of
+        ok ->
+            run_split(St#split_state{state = deleting_source});
+        {error, Reason} ->
+            %% CRITICAL: Do NOT delete source if verification fails.
+            %% Leave both source and targets live. Alert operator.
+            couch_log:error(
+                "mem3_reshard_rep: VERIFICATION FAILED for ~s: ~p. "
+                "Source NOT deleted. Manual intervention required.",
+                [Source#shard.name, Reason]),
+            {error, {verification_failed, Reason}}
+    end;
+
+run_split(#split_state{state = deleting_source} = St) ->
+    #split_state{source = Source} = St,
+    couch_log:notice("mem3_reshard_rep: deleting source ~s", [Source#shard.name]),
+    case delete_source(Source) of
+        ok ->
+            couch_log:notice("mem3_reshard_rep: split completed for ~s",
+                [Source#shard.name]),
+            ok;
+        {error, _} = Err ->
+            Err
+    end.
+
+do_topoff(#split_state{source = Source, target_map = TMap}) ->
+    topoff(Source, TMap, [{batch_size, 500}, {batch_count, all}]).
+
+%% ===================================================================
+%% Split operations
+%% ===================================================================
+
+%% @doc Create target shard databases. Idempotent — skips existing DBs.
+-spec create_target_dbs([#shard{}]) -> ok | {error, term()}.
+create_target_dbs(Targets) ->
+    UniqueTargets = unique_range_targets(Targets),
+    Errors = lists:filtermap(fun(#shard{name = Name, node = Node}) ->
+        case create_db_on_node(Name, Node) of
+            ok -> false;
+            already_exists -> false;
+            {error, Reason} -> {true, {Name, Node, Reason}}
+        end
+    end, UniqueTargets),
+    case Errors of
+        [] -> ok;
+        _ -> {error, {create_failed, Errors}}
+    end.
+
+create_db_on_node(DbName, Node) when Node =:= node() ->
+    case couch_server:exists(DbName) of
+        true -> already_exists;
+        false ->
+            case couch_db:create(DbName, [?ADMIN_CTX]) of
+                {ok, Db} ->
+                    couch_db:close(Db),
+                    ok;
+                {file_exists, _} ->
+                    already_exists;
+                Error ->
+                    {error, Error}
+            end
+    end;
+create_db_on_node(DbName, Node) ->
+    case rpc:call(Node, ?MODULE, create_db_on_node, [DbName, Node], 30000) of
+        ok -> ok;
+        already_exists -> already_exists;
+        {error, _} = Err -> Err;
+        {badrpc, Reason} -> {error, {rpc_failed, Node, Reason}}
+    end.
+
+%% @doc Run mem3_rep replication from source to targets.
+-spec replicate(#shard{}, #{}, list()) -> ok | {error, term()}.
+replicate(Source, TMap, Opts) ->
+    Timeout = config:get_integer("rexi", "shard_split_timeout_msec", 600000),
+    FullOpts = [{rexi_timeout, Timeout} | Opts],
+    case mem3_rep:go(Source, TMap, FullOpts) of
+        {ok, _Count} -> ok;
+        {error, Error} -> {error, Error}
+    end.
+
+%% @doc Run a topoff (catch-up replication) pass.
+-spec topoff(#shard{}, #{}, list()) -> ok | {error, term()}.
+topoff(Source, TMap, Opts) ->
+    replicate(Source, TMap, Opts).
+
+%% @doc Copy local docs from source to targets.
+%% Delegates to couch_db_split:copy_local_docs/3 which handles
+%% checkpoint translation, security docs, etc.
+-spec copy_local_docs(#shard{}, #{}) -> ok | {error, term()}.
+copy_local_docs(#shard{name = SourceName}, TMap) ->
+    %% Build the range→name map that couch_db_split expects
+    Targets = maps:map(fun(_Range, #shard{name = Name}) -> Name end, TMap),
+    PickFun = fun(DocId, Ranges, HashFun) ->
+        mem3_reshard_job:pickfun(DocId, Ranges, HashFun)
+    end,
+    try
+        couch_db_split:copy_local_docs(SourceName, Targets, PickFun),
+        ok
+    catch
+        _:Error ->
+            {error, {copy_local_docs_failed, Error}}
+    end.
+
+%% @doc Update the shard map in _dbs to point to target shards.
+%% This is the point of no return — after this, clients route to targets.
+-spec update_shard_map(#shard{}, [#shard{}]) -> ok | {error, term()}.
+update_shard_map(Source, Targets) ->
+    %% Use mem3_reshard_dbdoc which handles by_node, by_range, changelog,
+    %% and waits for propagation to all live nodes.
+    %% It expects a #job{} record, so we build a minimal one.
+    try
+        %% Get unique targets (one per range, for current node)
+        UniqueTargets = unique_range_targets(Targets),
+        DocId = mem3:dbname(Source#shard.name),
+        case mem3:get_db_doc(DocId) of
+            {ok, #doc{body = Body} = Doc} ->
+                NewBody = mem3_reshard_dbdoc:update_shard_props(
+                    Body, Source, UniqueTargets),
+                NewDoc = Doc#doc{body = NewBody},
+                case mem3:update_db_doc(NewDoc) of
+                    {ok, _} ->
+                        %% Wait for propagation
+                        wait_shard_map_propagated(Source, 60),
+                        ok;
+                    {error, UpdateError} ->
+                        {error, {shard_map_update_failed, UpdateError}}
+                end;
+            Error ->
+                {error, {shard_map_read_failed, Error}}
+        end
+    catch
+        _:Err ->
+            {error, {shard_map_update_exception, Err}}
+    end.
+
+wait_shard_map_propagated(_Source, 0) ->
+    couch_log:warning("mem3_reshard_rep: shard map propagation timed out", []),
+    ok;  % Continue anyway — map will eventually propagate
+wait_shard_map_propagated(#shard{name = Name} = Source, RetriesLeft) ->
+    timer:sleep(5000),
+    DbName = mem3:dbname(Name),
+    Shards = try mem3:shards(DbName) catch _:_ -> [] end,
+    SourceStillPresent = lists:any(fun(S) ->
+        S#shard.name =:= Name andalso S#shard.node =:= Source#shard.node
+    end, Shards),
+    case SourceStillPresent of
+        false -> ok;
+        true -> wait_shard_map_propagated(Source, RetriesLeft - 1)
+    end.
+
+%% @doc Verify consistency between source and targets.
+%% ALL checks must pass before source deletion.
+-spec verify_consistency(binary(), [binary()]) -> ok | {error, term()}.
+verify_consistency(SourceName, TargetNames) ->
+    case verify_doc_counts(SourceName, TargetNames) of
+        ok ->
+            HashFun = mem3_hash:get_hash_fun(SourceName),
+            verify_doc_distribution(SourceName, TargetNames, HashFun);
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @doc Build view indices on target shards.
+build_indices(Targets) ->
+    UniqueTargets = unique_range_targets(Targets),
+    lists:foreach(fun(#shard{name = Name}) ->
+        try
+            {ok, Db} = couch_db:open_int(Name, [?ADMIN_CTX]),
+            try
+                {ok, DDocs} = couch_db:get_design_docs(Db),
+                lists:foreach(fun(DDoc) ->
+                    catch couch_mrview:refresh(Name, DDoc)
+                end, DDocs)
+            after
+                couch_db:close(Db)
+            end
+        catch
+            _:_ -> ok  % Index build is best-effort
+        end
+    end, UniqueTargets).
+
+%% @doc Delete the source shard after successful split.
+-spec delete_source(#shard{}) -> ok | {error, term()}.
+delete_source(#shard{name = Name, node = Node}) when Node =:= node() ->
+    case couch_server:delete(Name, [?ADMIN_CTX]) of
+        ok -> ok;
+        not_found -> ok;
+        Error -> {error, {delete_failed, Error}}
+    end;
+delete_source(#shard{name = Name, node = Node}) ->
+    case rpc:call(Node, couch_server, delete, [Name, [?ADMIN_CTX]], 30000) of
+        ok -> ok;
+        not_found -> ok;
+        {badrpc, Reason} -> {error, {rpc_failed, Node, Reason}};
+        Error -> {error, {delete_failed, Error}}
+    end.
+
+%% Return one target shard per unique range (dedup replicas)
+unique_range_targets(Targets) ->
+    maps:values(build_target_map(Targets)).
 
 %% ===================================================================
 %% Internal helpers

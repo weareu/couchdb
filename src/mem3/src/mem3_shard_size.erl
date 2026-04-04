@@ -34,6 +34,7 @@
 %% Exported for testing
 -export([
     scan_local/1,
+    scan_one/3,
     is_shard/1
 ]).
 

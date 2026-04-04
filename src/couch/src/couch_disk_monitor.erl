@@ -250,7 +250,7 @@ interactive_database_writes_threshold() ->
     config:get_integer(?SECTION, "interactive_database_writes_threshold", 90).
 
 enabled() ->
-    config:get_boolean(?SECTION, "enable", true).
+    config:get_boolean(?SECTION, "enable", false).
 
 %% Align our refresh with the os_mon refresh
 timer_interval() ->

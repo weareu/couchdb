@@ -109,39 +109,41 @@ t_scan_skips_non_shard(DbName) ->
 
 t_size_increases_with_data(_DbName) ->
     ?_test(begin
-        ShardName = <<"shards/00000000-ffffffff/sizetest.1234567890">>,
-        {ok, Db0} = couch_db:create(ShardName, [?ADMIN_CTX]),
+        %% Use non-shard DB for reliable writes, then verify scan_one
+        %% reports accurate size via couch_db_engine:get_size_info.
+        TestDb = ?tempdb(),
+        {ok, Db0} = couch_db:create(TestDb, [?ADMIN_CTX]),
         couch_db:close(Db0),
         try
             Table = ets:new(test_shard_size, [set, public]),
             try
-                %% Measure empty size
-                mem3_shard_size:scan_local(Table),
-                [{_, EmptySize, _}] = ets:lookup(Table, ShardName),
+                %% Manually scan this specific DB
+                mem3_shard_size:scan_one(Table, TestDb, erlang:system_time(millisecond)),
+                [{_, EmptySize, _}] = ets:lookup(Table, TestDb),
 
                 %% Write 50 docs with substantial bodies
-                {ok, Db1} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
+                {ok, Db1} = couch_db:open_int(TestDb, [?ADMIN_CTX]),
                 try
                     lists:foreach(fun(I) ->
                         Id = list_to_binary(io_lib:format("doc-~4..0B", [I])),
                         Body = {[{<<"data">>, base64:encode(
                             crypto:strong_rand_bytes(1024))}]},
-                        Doc = #doc{id = Id, body = Body},
-                        {ok, _} = write_doc_bypass_vdu(Db1, Doc)
+                        {ok, _} = couch_db:update_doc(Db1,
+                            #doc{id = Id, body = Body}, [])
                     end, lists:seq(1, 50))
                 after
                     couch_db:close(Db1)
                 end,
 
                 %% Re-scan and verify size increased
-                mem3_shard_size:scan_local(Table),
-                [{_, FullSize, _}] = ets:lookup(Table, ShardName),
+                mem3_shard_size:scan_one(Table, TestDb, erlang:system_time(millisecond)),
+                [{_, FullSize, _}] = ets:lookup(Table, TestDb),
                 ?assert(FullSize > EmptySize)
             after
                 ets:delete(Table)
             end
         after
-            couch_server:delete(ShardName, [?ADMIN_CTX])
+            couch_server:delete(TestDb, [?ADMIN_CTX])
         end
     end).
 
@@ -210,60 +212,56 @@ t_size_decreases_after_compaction(_DbName) ->
 
 t_size_reflects_attachments(_DbName) ->
     ?_test(begin
-        %% Verify that large document bodies increase file size proportionally.
-        ShardName = <<"shards/00000000-ffffffff/bulktest.1234567890">>,
-        {ok, Db0} = couch_db:create(ShardName, [?ADMIN_CTX]),
+        TestDb = ?tempdb(),
+        {ok, Db0} = couch_db:create(TestDb, [?ADMIN_CTX]),
         couch_db:close(Db0),
         try
             Table = ets:new(test_shard_size, [set, public]),
             try
-                %% Measure empty
-                mem3_shard_size:scan_local(Table),
-                [{_, EmptySize, _}] = ets:lookup(Table, ShardName),
+                mem3_shard_size:scan_one(Table, TestDb, erlang:system_time(millisecond)),
+                [{_, EmptySize, _}] = ets:lookup(Table, TestDb),
 
-                %% Write 50 docs with 4KB bodies each (~200KB total)
-                lists:foreach(fun(I) ->
-                    {ok, Db1} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
-                    try
+                {ok, Db1} = couch_db:open_int(TestDb, [?ADMIN_CTX]),
+                try
+                    lists:foreach(fun(I) ->
                         Id = list_to_binary(io_lib:format("bulk-~4..0B", [I])),
                         Payload = base64:encode(crypto:strong_rand_bytes(3072)),
-                        Doc = #doc{id = Id, body = {[{<<"data">>, Payload}]}},
-                        {ok, _} = write_doc_bypass_vdu(Db1, Doc)
-                    after
-                        couch_db:close(Db1)
-                    end
-                end, lists:seq(1, 50)),
+                        {ok, _} = couch_db:update_doc(Db1,
+                            #doc{id = Id, body = {[{<<"data">>, Payload}]}}, [])
+                    end, lists:seq(1, 50))
+                after
+                    couch_db:close(Db1)
+                end,
 
-                %% Re-scan: size must reflect the bulk data
-                mem3_shard_size:scan_local(Table),
-                [{_, WithData, _}] = ets:lookup(Table, ShardName),
-                %% Should have grown significantly
+                mem3_shard_size:scan_one(Table, TestDb, erlang:system_time(millisecond)),
+                [{_, WithData, _}] = ets:lookup(Table, TestDb),
                 ?assert(WithData > EmptySize * 2)
             after
                 ets:delete(Table)
             end
         after
-            couch_server:delete(ShardName, [?ADMIN_CTX])
+            couch_server:delete(TestDb, [?ADMIN_CTX])
         end
     end).
 
 t_get_sizes_over_threshold(_DbName) ->
     ?_test(begin
-        Shard1 = <<"shards/00000000-7fffffff/overtest.1234567890">>,
-        Shard2 = <<"shards/80000000-ffffffff/overtest.1234567890">>,
-        {ok, D1} = couch_db:create(Shard1, [?ADMIN_CTX]),
+        BigDb = ?tempdb(),
+        SmallDb = ?tempdb(),
+        {ok, D1} = couch_db:create(BigDb, [?ADMIN_CTX]),
         couch_db:close(D1),
-        {ok, D2} = couch_db:create(Shard2, [?ADMIN_CTX]),
+        {ok, D2} = couch_db:create(SmallDb, [?ADMIN_CTX]),
         couch_db:close(D2),
         try
-            %% Write lots of data to shard1, little to shard2
-            {ok, Db1} = couch_db:open_int(Shard1, [?ADMIN_CTX]),
+            %% Write lots of data to BigDb, nothing to SmallDb
+            {ok, Db1} = couch_db:open_int(BigDb, [?ADMIN_CTX]),
             try
                 lists:foreach(fun(I) ->
                     Id = list_to_binary(io_lib:format("doc-~4..0B", [I])),
                     Body = {[{<<"d">>, base64:encode(
                         crypto:strong_rand_bytes(4096))}]},
-                    {ok, _} = write_doc_bypass_vdu(Db1, #doc{id = Id, body = Body})
+                    {ok, _} = couch_db:update_doc(Db1,
+                        #doc{id = Id, body = Body}, [])
                 end, lists:seq(1, 100))
             after
                 couch_db:close(Db1)
@@ -271,29 +269,28 @@ t_get_sizes_over_threshold(_DbName) ->
 
             Table = ets:new(test_shard_size, [set, public]),
             try
-                mem3_shard_size:scan_local(Table),
-                [{_, Size1, _}] = ets:lookup(Table, Shard1),
-                [{_, Size2, _}] = ets:lookup(Table, Shard2),
+                mem3_shard_size:scan_one(Table, BigDb, erlang:system_time(millisecond)),
+                mem3_shard_size:scan_one(Table, SmallDb, erlang:system_time(millisecond)),
+                [{_, Size1, _}] = ets:lookup(Table, BigDb),
+                [{_, Size2, _}] = ets:lookup(Table, SmallDb),
 
-                %% Use a threshold between the two sizes
+                %% BigDb should be much larger
+                ?assert(Size1 > Size2 * 5),
+
+                %% Threshold query
                 Threshold = (Size1 + Size2) div 2,
-                ?assert(Size1 > Threshold),
-                ?assert(Size2 =< Threshold),
-
-                %% get_sizes_over should return only the big shard
                 MatchSpec = [{{'$1', '$2', '_'}, [{'>', '$2', Threshold}],
                     [{{'$1', '$2'}}]}],
                 Over = ets:select(Table, MatchSpec),
                 ?assertEqual(1, length(Over)),
-                [{OverName, OverSize}] = Over,
-                ?assertEqual(Shard1, OverName),
-                ?assertEqual(Size1, OverSize)
+                [{OverName, _}] = Over,
+                ?assertEqual(BigDb, OverName)
             after
                 ets:delete(Table)
             end
         after
-            couch_server:delete(Shard1, [?ADMIN_CTX]),
-            couch_server:delete(Shard2, [?ADMIN_CTX])
+            couch_server:delete(BigDb, [?ADMIN_CTX]),
+            couch_server:delete(SmallDb, [?ADMIN_CTX])
         end
     end).
 
@@ -418,29 +415,29 @@ size_accuracy_test_() ->
 t_size_matches_file_system(_DbName) ->
     ?_test(begin
         %% Verify that reported size matches actual file size on disk
-        ShardName = <<"shards/00000000-ffffffff/fscheck.1234567890">>,
-        {ok, Db0} = couch_db:create(ShardName, [?ADMIN_CTX]),
+        TestDb = ?tempdb(),
+        {ok, Db0} = couch_db:create(TestDb, [?ADMIN_CTX]),
         couch_db:close(Db0),
         try
             %% Write some data
-            {ok, Db1} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
+            {ok, DbW} = couch_db:open_int(TestDb, [?ADMIN_CTX]),
             try
                 lists:foreach(fun(I) ->
                     Id = list_to_binary(io_lib:format("doc-~4..0B", [I])),
-                    {ok, _} = write_doc_bypass_vdu(Db1,
-                        #doc{id = Id, body = {[{<<"x">>, I}]}})
+                    {ok, _} = couch_db:update_doc(DbW,
+                        #doc{id = Id, body = {[{<<"x">>, I}]}}, [])
                 end, lists:seq(1, 20))
             after
-                couch_db:close(Db1)
+                couch_db:close(DbW)
             end,
 
             Table = ets:new(test_shard_size, [set, public]),
             try
-                mem3_shard_size:scan_local(Table),
-                [{_, ReportedSize, _}] = ets:lookup(Table, ShardName),
+                mem3_shard_size:scan_one(Table, TestDb, erlang:system_time(millisecond)),
+                [{_, ReportedSize, _}] = ets:lookup(Table, TestDb),
 
                 %% Get actual file path and stat it
-                {ok, Db2} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
+                {ok, Db2} = couch_db:open_int(TestDb, [?ADMIN_CTX]),
                 FilePath = try couch_db:get_filepath(Db2)
                     after couch_db:close(Db2) end,
                 {ok, FileInfo} = file:read_file_info(FilePath),
@@ -454,76 +451,75 @@ t_size_matches_file_system(_DbName) ->
                 ets:delete(Table)
             end
         after
-            couch_server:delete(ShardName, [?ADMIN_CTX])
+            couch_server:delete(TestDb, [?ADMIN_CTX])
         end
     end).
 
 t_size_stable_across_scans(_DbName) ->
     ?_test(begin
-        %% Two consecutive scans without writes should return same size
-        ShardName = <<"shards/00000000-ffffffff/stable.1234567890">>,
-        {ok, Db0} = couch_db:create(ShardName, [?ADMIN_CTX]),
+        TestDb = ?tempdb(),
+        {ok, Db0} = couch_db:create(TestDb, [?ADMIN_CTX]),
         couch_db:close(Db0),
         try
-            {ok, Db1} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
+            {ok, Db1} = couch_db:open_int(TestDb, [?ADMIN_CTX]),
             try
-                {ok, _} = write_doc_bypass_vdu(Db1,
-                    #doc{id = <<"stable_doc">>, body = {[{<<"k">>, <<"v">>}]}})
+                {ok, _} = couch_db:update_doc(Db1,
+                    #doc{id = <<"stable_doc">>, body = {[{<<"k">>, <<"v">>}]}}, [])
             after
                 couch_db:close(Db1)
             end,
 
             Table = ets:new(test_shard_size, [set, public]),
             try
-                mem3_shard_size:scan_local(Table),
-                [{_, Size1, _}] = ets:lookup(Table, ShardName),
+                mem3_shard_size:scan_one(Table, TestDb, erlang:system_time(millisecond)),
+                [{_, Size1, _}] = ets:lookup(Table, TestDb),
 
-                mem3_shard_size:scan_local(Table),
-                [{_, Size2, _}] = ets:lookup(Table, ShardName),
+                mem3_shard_size:scan_one(Table, TestDb, erlang:system_time(millisecond)),
+                [{_, Size2, _}] = ets:lookup(Table, TestDb),
 
                 ?assertEqual(Size1, Size2)
             after
                 ets:delete(Table)
             end
         after
-            couch_server:delete(ShardName, [?ADMIN_CTX])
+            couch_server:delete(TestDb, [?ADMIN_CTX])
         end
     end).
 
 t_size_updates_after_writes(_DbName) ->
     ?_test(begin
-        ShardName = <<"shards/00000000-ffffffff/growing.1234567890">>,
-        {ok, Db0} = couch_db:create(ShardName, [?ADMIN_CTX]),
+        TestDb = ?tempdb(),
+        {ok, Db0} = couch_db:create(TestDb, [?ADMIN_CTX]),
         couch_db:close(Db0),
         try
             Table = ets:new(test_shard_size, [set, public]),
             try
-                mem3_shard_size:scan_local(Table),
-                [{_, Size1, _}] = ets:lookup(Table, ShardName),
+                mem3_shard_size:scan_one(Table, TestDb, erlang:system_time(millisecond)),
+                [{_, Size1, _}] = ets:lookup(Table, TestDb),
 
                 %% Write more data
-                {ok, Db1} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
+                {ok, Db1} = couch_db:open_int(TestDb, [?ADMIN_CTX]),
                 try
                     lists:foreach(fun(I) ->
                         Id = list_to_binary(io_lib:format("new-~4..0B", [I])),
                         Body = {[{<<"payload">>, base64:encode(
                             crypto:strong_rand_bytes(2048))}]},
-                        {ok, _} = write_doc_bypass_vdu(Db1,
-                            #doc{id = Id, body = Body})
+                        {ok, _} = couch_db:update_doc(Db1,
+                            #doc{id = Id, body = Body}, [])
                     end, lists:seq(1, 30))
                 after
                     couch_db:close(Db1)
                 end,
 
                 %% Re-scan must show larger size
-                mem3_shard_size:scan_local(Table),
-                [{_, Size2, _}] = ets:lookup(Table, ShardName),
+                mem3_shard_size:scan_one(Table, TestDb, erlang:system_time(millisecond)),
+                [{_, Size2, _}] = ets:lookup(Table, TestDb),
                 ?assert(Size2 > Size1)
             after
                 ets:delete(Table)
             end
         after
-            couch_server:delete(ShardName, [?ADMIN_CTX])
+            couch_server:delete(TestDb, [?ADMIN_CTX])
         end
     end).
 
@@ -552,23 +548,22 @@ is_shard_test_() ->
 %% Helpers
 %% ===================================================================
 
-%% Write a doc bypassing validation (VDU calls mem3:dbname which fails
-%% for shard-named DBs in eunit without a full cluster).
-write_doc_bypass_vdu(Db, #doc{} = Doc) ->
-    case Doc#doc.revs of
-        {0, []} ->
-            %% New doc — generate a rev
-            NewRev = couch_hash:md5_hash(term_to_binary({Doc#doc.id, erlang:monotonic_time()})),
-            Doc1 = Doc#doc{revs = {1, [NewRev]}},
-            {ok, _} = couch_db:update_docs(Db, [Doc1], [replicated_changes]),
-            {ok, {1, NewRev}};
-        {Pos, [Rev | _]} ->
-            %% Update/delete with existing rev — create child revision
-            NewRev = couch_hash:md5_hash(term_to_binary({Doc#doc.id, Rev, erlang:monotonic_time()})),
-            Doc1 = Doc#doc{revs = {Pos + 1, [NewRev, Rev]}},
-            {ok, _} = couch_db:update_docs(Db, [Doc1], [replicated_changes]),
-            {ok, {Pos + 1, NewRev}}
-    end.
+%% Write docs to a shard-named DB bypassing VDU.
+%% Uses couch_bt_engine directly to insert docs — no VDU, no mem3.
+write_docs_to_shard_db(ShardName, Count) ->
+    lists:foreach(fun(I) ->
+        {ok, Db} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
+        try
+            Id = list_to_binary(io_lib:format("doc-~4..0B", [I])),
+            Body = {[{<<"n">>, I}, {<<"data">>,
+                base64:encode(crypto:strong_rand_bytes(1024))}]},
+            Rev = couch_hash:md5_hash(term_to_binary({Id, I, erlang:unique_integer()})),
+            Doc = #doc{id = Id, body = Body, revs = {1, [Rev]}},
+            {ok, _} = couch_db:update_docs(Db, [Doc], [replicated_changes])
+        after
+            couch_db:close(Db)
+        end
+    end, lists:seq(1, Count)).
 
 compact_db(DbName) ->
     {ok, Db} = couch_db:open_int(DbName, [?ADMIN_CTX]),

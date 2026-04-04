@@ -13,7 +13,8 @@
 -module(mem3_reshard_dbdoc).
 
 -export([
-    update_shard_map/1
+    update_shard_map/1,
+    update_shard_props/3
 ]).
 
 -include_lib("couch/include/couch_db.hrl").
