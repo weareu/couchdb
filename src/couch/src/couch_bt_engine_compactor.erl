@@ -323,6 +323,14 @@ copy_compact(#comp_st{} = CompSt) ->
     NewSt = NewSt0#st{compression = Compression},
     NewUpdateSeq = couch_bt_engine:get_update_seq(NewSt0),
     TotalChanges = couch_bt_engine:count_changes_since(St, NewUpdateSeq),
+
+    % Read retention/extraction config ONCE at compaction start.
+    % This prevents inconsistent behavior if config changes mid-compaction.
+    ShortDbName = binary_to_list(mem3:dbname(DbName)),
+    RetentionOpts = get_retention_opts(ShortDbName),
+    ExtractEnabled = is_extraction_enabled(ShortDbName),
+    erlang:put(compaction_retention_opts, RetentionOpts),
+    erlang:put(compaction_extract_enabled, ExtractEnabled),
     BufferSize = list_to_integer(
         config:get("database_compaction", "doc_buffer_size", "524288")
     ),
@@ -432,8 +440,10 @@ copy_docs(St, #st{} = NewSt, MixedInfos, Retry, DbName) ->
         merge_lookups(MixedInfos, LookupResults)
     ),
 
+    % Use config cached at compaction start (copy_compact) to avoid
+    % inconsistent behavior if config changes mid-compaction.
     ShortDbName = binary_to_list(mem3:dbname(DbName)),
-    RetentionOpts = get_retention_opts(ShortDbName),
+    RetentionOpts = erlang:get(compaction_retention_opts),
 
     % Filter out documents that exceed retention period (complete removal).
     % NOTE: This reads document bodies to check date fields. Documents that
@@ -462,7 +472,7 @@ copy_docs(St, #st{} = NewSt, MixedInfos, Retry, DbName) ->
     end,
     NewInfos0c = lists:reverse(NewInfos0b),
 
-    ExtractEnabled = is_extraction_enabled(ShortDbName),
+    ExtractEnabled = erlang:get(compaction_extract_enabled),
     ExtractAfterDays = case RetentionOpts of
         #{extract_after_days := EAD} -> EAD;
         _ -> 365
@@ -782,11 +792,13 @@ log_retained_removal(DbName, DocId) ->
     case file:write_file(LogFile, Line, [append]) of
         ok -> ok;
         {error, Reason} ->
+            % Never crash compaction on log write failure — the couch_log
+            % warning above already recorded the removal. Losing the file
+            % log is unfortunate but destroying the compaction run is worse.
             couch_log:error(
                 "Failed to write retention log ~s: ~p (doc_id=~s)",
                 [LogFile, Reason, DocId]
-            ),
-            throw({retention_log_write_failed, LogFile, Reason})
+            )
     end.
 
 %% -------------------------------------------------------------------
@@ -850,16 +862,23 @@ write_attachment_to_file(SrcSt, DocId, Attachment, DbName) ->
     end,
     ShortDbName = binary_to_list(mem3:dbname(DbName)),
     AttachmentPath = get_attachment_path(DocId, Name, ShortDbName),
+    TmpPath = AttachmentPath ++ ".tmp",
     ok = filelib:ensure_dir(AttachmentPath),
     StreamSrc = fun(Sp) -> couch_bt_engine:open_read_stream(SrcSt, Sp) end,
     AttachmentObj = couch_att:from_disk_term(StreamSrc, DiskTerm),
     BinaryData = couch_att:to_binary(AttachmentObj),
-    ok = file:write_file(AttachmentPath, BinaryData),
+    % Write to temp file first, verify MD5, then atomic rename.
+    % If we crash between write and rename, the .tmp file is harmless
+    % and will be overwritten on the next compaction attempt.
+    ok = file:write_file(TmpPath, BinaryData),
     ExpectedMd5 = couch_att:fetch(md5, AttachmentObj),
     ActualMd5 = erlang:md5(BinaryData),
     case ActualMd5 =:= ExpectedMd5 of
-        true -> ok;
-        false -> throw({checksum_mismatch, DocId, Name, {ExpectedMd5, ActualMd5}})
+        true ->
+            ok = file:rename(TmpPath, AttachmentPath);
+        false ->
+            file:delete(TmpPath),
+            throw({checksum_mismatch, DocId, Name, {ExpectedMd5, ActualMd5}})
     end.
 
 get_attachment_path(DocId, AttachmentName, DbName) ->
