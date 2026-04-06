@@ -280,9 +280,11 @@ raw_free(Node) when Node =:= node() ->
         _:_ -> 0
     end;
 raw_free(_RemoteNode) ->
-    %% For remote nodes, we'd need RPC. For now, assume unlimited
-    %% (remote checks happen via mem3_node_capacity for splits).
-    infinity.
+    %% Conservative default for remote nodes: refuse reservations.
+    %% Remote node space is tracked by mem3_node_capacity for splits.
+    %% Returning 0 means couch_space_monitor will deny reservations
+    %% for remote nodes — callers must use mem3_node_capacity instead.
+    0.
 
 tag_to_description({compaction, Name}) ->
     iolist_to_binary(io_lib:format("database compaction: ~s", [Name]));

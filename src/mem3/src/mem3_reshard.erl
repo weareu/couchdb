@@ -864,7 +864,7 @@ jobfmt(#job{} = Job) ->
 %% @doc Reserve space for a manual split job via couch_space_monitor.
 %% Estimates 3x source shard size (data + compaction + index).
 maybe_reserve_split_space(#job{source = Source, id = Id}) ->
-    case config:get_boolean("smoosh", "check_space_before_compact", false) of
+    case space_check_enabled() of
         false -> ok;
         true ->
             Tag = {manual_split, Id},
@@ -881,12 +881,18 @@ maybe_reserve_split_space(#job{source = Source, id = Id}) ->
 
 %% @doc Release space reservation for a manual split job.
 release_split_space(#job{id = Id}) ->
-    case config:get_boolean("smoosh", "check_space_before_compact", false) of
+    case space_check_enabled() of
         false -> ok;
         true ->
             Tag = {manual_split, Id},
             couch_space_monitor:release(Tag)
     end.
+
+%% @doc Check if space reservation is enabled for reshard.
+%% Uses its own config key, not smoosh's.
+space_check_enabled() ->
+    config:get_boolean("reshard", "check_space_before_split",
+        config:get_boolean("space_monitor", "enabled", false)).
 
 estimate_split_size(#shard{name = Name}) ->
     try

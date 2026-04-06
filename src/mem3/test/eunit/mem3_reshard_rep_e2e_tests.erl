@@ -1010,9 +1010,9 @@ t_view_query_returns_data_on_target() ->
                         couch_db:close(TDb)
                     end;
                 [] ->
-                    %% Design doc not in any target — replicate might
-                    %% have placed it based on hash, skip this assertion
-                    ok
+                    %% Design doc must exist in at least one target
+                    error({design_doc_not_found_in_any_target,
+                           <<"_design/test_view">>})
             end
         after
             cleanup(Source, Targets)

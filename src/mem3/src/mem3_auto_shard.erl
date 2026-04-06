@@ -78,7 +78,9 @@
     paused :: boolean(),
     exclude_patterns :: [binary()],
     protected_dbs :: [binary()],
-    active_splits :: #{binary() => pid()},
+    %% Key = ShardName, Value = {Pid, PerTarget, NumTargets}
+    %% Tracks exact reservation amount for clean release on completion.
+    active_splits :: #{binary() => {pid(), non_neg_integer(), pos_integer()}},
     cooldowns :: #{binary() => non_neg_integer()},
     %% Per-node space reservations for in-flight splits.
     %% Prevents thundering herd: 50 oversized databases won't all
@@ -259,11 +261,17 @@ do_start_split(ShardName, Factor, State) ->
         Shard = mem3_reshard:shard_from_name(ShardName),
         SourceSize = byte_size_to_int(ShardName, State),
         N = config:get_integer("cluster", "n", 3),
-        TargetNodes = mem3_node_capacity:best_nodes(
+        AllTargetNodes = mem3_node_capacity:best_nodes(
             SourceSize div Factor, N * Factor, []),
+        %% Filter out nodes that are not currently connected.
+        %% Prevents starting splits against nodes that went down
+        %% between the last capacity scan and now.
+        LiveNodes = [node() | nodes()],
+        TargetNodes = [TN || TN <- AllTargetNodes,
+                             lists:member(TN, LiveNodes)],
         case TargetNodes of
             [] ->
-                {error, no_target_nodes};
+                {error, no_live_target_nodes};
             _ ->
                 %% Cluster-aware pre-flight: subtract space already reserved
                 %% by in-flight splits from available free space.
@@ -299,13 +307,11 @@ do_start_split(ShardName, Factor, State) ->
                             timer:cancel(TRef),
                             exit({split_result, ShardName, Result})
                         end),
-                        DbName = mem3:dbname(ShardName),
-                        Now = erlang:system_time(millisecond),
+                        NumTargets = length(TargetNodes),
                         NewState = State#state{
-                            active_splits = maps:put(ShardName, Pid,
+                            active_splits = maps:put(ShardName,
+                                {Pid, PerTarget, NumTargets},
                                 State#state.active_splits),
-                            cooldowns = maps:put(DbName, Now,
-                                State#state.cooldowns),
                             space_reservations = NewReservations,
                             splits_triggered = State#state.splits_triggered + 1
                         },
@@ -343,35 +349,30 @@ byte_size_to_int(ShardName, _State) ->
 
 handle_split_done(Pid, Reason, State) ->
     %% Find which shard this pid was splitting
-    case maps:fold(fun(Shard, P, Acc) ->
+    case maps:fold(fun(Shard, {P, _, _}, Acc) ->
         case P =:= Pid of true -> Shard; false -> Acc end
     end, undefined, State#state.active_splits) of
         undefined ->
             State;
         ShardName ->
+            %% Use the exact reservation amounts stored at split start.
+            %% This avoids CRITICAL-3: recalculating from possibly-stale
+            %% shard size cache after timeout or source deletion.
+            {_Pid, PerTarget, NumTargets} = maps:get(ShardName,
+                State#state.active_splits),
             NewActive = maps:remove(ShardName, State#state.active_splits),
-            %% Release space reservations for this split.
-            %% We don't track which nodes each split reserved — release
-            %% proportional share by recalculating from remaining active splits.
-            %% Simpler: just release the reservation for this shard's size.
-            SourceSize = byte_size_to_int(ShardName, State),
-            SpaceFactor = config:get_integer(
-                "auto_shard", "min_free_space_factor", 3),
-            N = config:get_integer("cluster", "n", 3),
-            Factor = calculate_split_factor(
-                SourceSize, State#state.max_shard_size_bytes),
-            Factor2 = min(Factor, State#state.max_split_factor),
-            PerTarget = (SourceSize div Factor2) * SpaceFactor,
             NewReservations = release_reservations(
-                State#state.space_reservations, PerTarget, N * Factor2),
+                State#state.space_reservations, PerTarget, NumTargets),
             %% Also release from central space monitor
             catch couch_space_monitor:release({auto_split, ShardName}),
+            DbName = mem3:dbname(ShardName),
+            Now = erlang:system_time(millisecond),
             case Reason of
                 {split_result, ShardName, ok} ->
                     couch_log:notice(
                         "mem3_auto_shard: split completed for ~s"
-                        " [released reservations, remaining: ~B bytes]",
-                        [ShardName,
+                        " [released ~B bytes, remaining: ~B bytes]",
+                        [ShardName, PerTarget * NumTargets,
                          maps:fold(fun(_NN, B, Acc) -> Acc + B end,
                              0, NewReservations)]);
                 {split_result, ShardName, {error, Err}} ->
@@ -383,9 +384,12 @@ handle_split_done(Pid, Reason, State) ->
                         "mem3_auto_shard: split process died for ~s: ~p",
                         [ShardName, Other])
             end,
+            %% HIGH-1 fix: set cooldown on COMPLETION, not start.
+            %% This gives the cluster time to stabilize AFTER the split.
             State#state{
                 active_splits = NewActive,
-                space_reservations = NewReservations
+                space_reservations = NewReservations,
+                cooldowns = maps:put(DbName, Now, State#state.cooldowns)
             }
     end.
 

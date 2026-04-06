@@ -147,9 +147,14 @@ build_target_map(Targets) ->
 %% ===================================================================
 
 %% @doc Verify doc counts: source == sum(targets).
+%% Retries up to 3 times with a short delay to handle concurrent writes
+%% that may arrive between reading source and target counts.
 %% Returns ok or {error, {count_mismatch, Expected, Got}}.
 -spec verify_doc_counts(binary(), [binary()]) -> ok | {error, term()}.
 verify_doc_counts(SourceName, TargetNames) ->
+    verify_doc_counts(SourceName, TargetNames, 3).
+
+verify_doc_counts(SourceName, TargetNames, RetriesLeft) ->
     {ok, SourceDb} = couch_db:open_int(SourceName, [?ADMIN_CTX]),
     SourceInfo = try couch_db:get_db_info(SourceDb)
         after couch_db:close(SourceDb) end,
@@ -165,15 +170,24 @@ verify_doc_counts(SourceName, TargetNames) ->
         {CAcc + TC, DAcc + TD}
     end, {0, 0}, TargetNames),
 
-    case SourceCount =:= TargetCounts of
-        false ->
-            {error, {doc_count_mismatch, SourceCount, TargetCounts}};
+    case SourceCount =:= TargetCounts andalso SourceDeleted =:= TargetDeleted of
         true ->
-            case SourceDeleted =:= TargetDeleted of
-                false ->
-                    {error, {del_count_mismatch, SourceDeleted, TargetDeleted}};
+            ok;
+        false when RetriesLeft > 0 ->
+            %% Counts may differ due to concurrent writes arriving between
+            %% reading source and targets. Wait briefly and retry.
+            couch_log:info(
+                "mem3_reshard_rep: doc count mismatch (source=~B, targets=~B), "
+                "retrying (~B left)",
+                [SourceCount, TargetCounts, RetriesLeft]),
+            timer:sleep(1000),
+            verify_doc_counts(SourceName, TargetNames, RetriesLeft - 1);
+        false ->
+            case SourceCount =/= TargetCounts of
                 true ->
-                    ok
+                    {error, {doc_count_mismatch, SourceCount, TargetCounts}};
+                false ->
+                    {error, {del_count_mismatch, SourceDeleted, TargetDeleted}}
             end
     end.
 
@@ -876,14 +890,22 @@ load_checkpoint(SourceName) ->
         try
             case couch_db:open_doc(Db, DocId, [ejson_body]) of
                 {ok, #doc{body = {Props}}} ->
-                    {ok, #{
-                        state => binary_to_atom(
-                            couch_util:get_value(<<"state">>, Props), utf8),
-                        source => couch_util:get_value(<<"source">>, Props),
-                        targets => couch_util:get_value(<<"targets">>, Props, []),
-                        factor => couch_util:get_value(<<"factor">>, Props, 2),
-                        updated_at => couch_util:get_value(<<"updated_at">>, Props, 0)
-                    }};
+                    StateBin = couch_util:get_value(<<"state">>, Props),
+                    case validate_split_state(StateBin) of
+                        {ok, StateAtom} ->
+                            {ok, #{
+                                state => StateAtom,
+                                source => couch_util:get_value(<<"source">>, Props),
+                                targets => couch_util:get_value(<<"targets">>, Props, []),
+                                factor => couch_util:get_value(<<"factor">>, Props, 2),
+                                updated_at => couch_util:get_value(<<"updated_at">>, Props, 0)
+                            }};
+                        {error, _} ->
+                            couch_log:warning(
+                                "mem3_reshard_rep: invalid checkpoint state ~p in ~s",
+                                [StateBin, SourceName]),
+                            not_found
+                    end;
                 {not_found, _} ->
                     not_found
             end
@@ -896,6 +918,29 @@ load_checkpoint(SourceName) ->
 
 checkpoint_doc_id(SourceName) ->
     <<"_local/auto_split_checkpoint_", SourceName/binary>>.
+
+%% @doc Validate that a checkpoint state binary is a known split state.
+%% Prevents atom table exhaustion from corrupted/malicious checkpoint docs.
+-spec validate_split_state(binary()) -> {ok, atom()} | {error, unknown_state}.
+validate_split_state(StateBin) ->
+    ValidStates = [
+        {<<"creating_targets">>, creating_targets},
+        {<<"replicating">>, replicating},
+        {<<"topoff_1">>, topoff_1},
+        {<<"building_indices">>, building_indices},
+        {<<"topoff_2">>, topoff_2},
+        {<<"copying_local">>, copying_local},
+        {<<"topoff_3">>, topoff_3},
+        {<<"updating_map">>, updating_map},
+        {<<"topoff_post_map">>, topoff_post_map},
+        {<<"topoff_final">>, topoff_final},
+        {<<"verifying">>, verifying},
+        {<<"deleting_source">>, deleting_source}
+    ],
+    case lists:keyfind(StateBin, 1, ValidStates) of
+        {_, Atom} -> {ok, Atom};
+        false -> {error, unknown_state}
+    end.
 
 %% @doc Scan all local shards for interrupted split checkpoints.
 %% Returns list of #{source, state, targets, factor} maps.
