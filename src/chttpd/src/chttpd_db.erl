@@ -294,11 +294,14 @@ handle_compact_req(#httpd{method = 'POST'} = Req, Db) ->
     chttpd:validate_ctype(Req, "application/json"),
     case Req#httpd.path_parts of
         [_DbName, <<"_compact">>] ->
+            DbName = couch_db:name(Db),
+            ok = maybe_reserve_compact_space(DbName),
             ok = fabric:compact(Db),
             send_json(Req, 202, {[{ok, true}]});
         [DbName, <<"_compact">>, DesignName | _] ->
             case ddoc_cache:open(DbName, <<"_design/", DesignName/binary>>) of
                 {ok, _DDoc} ->
+                    ok = maybe_reserve_compact_space({DbName, DesignName}),
                     ok = fabric:compact(Db, DesignName),
                     send_json(Req, 202, {[{ok, true}]});
                 Error ->
@@ -307,6 +310,51 @@ handle_compact_req(#httpd{method = 'POST'} = Req, Db) ->
     end;
 handle_compact_req(Req, _Db) ->
     send_method_not_allowed(Req, "POST").
+
+%% @doc Reserve space for manual compaction via couch_space_monitor.
+%% The reservation auto-releases when the calling process (request handler) dies.
+%% For manual compaction, we estimate 1x current file size.
+maybe_reserve_compact_space(Key) ->
+    case config:get_boolean("smoosh", "check_space_before_compact", false) of
+        false -> ok;
+        true ->
+            Tag = {manual_compact, Key},
+            EstBytes = estimate_manual_compact_size(Key),
+            case EstBytes of
+                0 -> ok;
+                _ ->
+                    case couch_space_monitor:reserve(Tag, node(), EstBytes) of
+                        ok -> ok;
+                        {error, {insufficient_space, Info}} ->
+                            throw({insufficient_storage,
+                                iolist_to_binary(io_lib:format(
+                                    "Not enough disk space for compaction. "
+                                    "Available: ~B, Requested: ~B, Reserved: ~B",
+                                    [maps:get(available, Info, 0),
+                                     maps:get(requested, Info, 0),
+                                     maps:get(reserved, Info, 0)]))})
+                    end
+            end
+    end.
+
+estimate_manual_compact_size({_DbName, _DesignName}) ->
+    0;  % View compaction size hard to estimate from HTTP layer
+estimate_manual_compact_size(DbName) when is_binary(DbName) ->
+    try
+        case couch_db:open_int(DbName, []) of
+            {ok, Db} ->
+                try
+                    {ok, Info} = couch_db:get_db_info(Db),
+                    {SizeInfo} = couch_util:get_value(sizes, Info),
+                    couch_util:get_value(file, SizeInfo, 0)
+                after
+                    couch_db:close(Db)
+                end;
+            _ -> 0
+        end
+    catch
+        _:_ -> 0
+    end.
 
 handle_view_cleanup_req(#httpd{method = 'POST'} = Req, Db) ->
     ok = fabric:cleanup_index_files_all_nodes(Db),

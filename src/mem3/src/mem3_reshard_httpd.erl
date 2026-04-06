@@ -277,7 +277,29 @@ handle_reshard_req(
     mem3_auto_shard:resume(),
     send_json(Req, {[{ok, true}]});
 handle_reshard_req(#httpd{path_parts = [_, <<"auto">> | _]} = Req) ->
-    send_method_not_allowed(Req, "GET,PUT,POST").
+    send_method_not_allowed(Req, "GET,PUT,POST");
+
+%% ===================================================================
+%% Space monitor endpoint: /_reshard/space
+%% ===================================================================
+
+% GET /_reshard/space — view all space reservations
+handle_reshard_req(#httpd{method = 'GET', path_parts = [_, <<"space">>]} = Req) ->
+    chttpd:verify_is_server_admin(Req),
+    Status = couch_space_monitor:status(),
+    %% Convert to JSON-safe format
+    Reservations = [reservation_to_json(R) || R <- maps:get(reservations, Status, [])],
+    ByNode = maps:fold(fun(N, B, Acc) ->
+        [{atom_to_binary(N, utf8), B} | Acc]
+    end, [], maps:get(by_node, Status, #{})),
+    send_json(Req, {[
+        {total_reserved_bytes, maps:get(total_reserved_bytes, Status, 0)},
+        {reservation_count, maps:get(reservation_count, Status, 0)},
+        {by_node, {ByNode}},
+        {reservations, Reservations}
+    ]});
+handle_reshard_req(#httpd{path_parts = [_, <<"space">>]} = Req) ->
+    send_method_not_allowed(Req, "GET").
 
 handle_auto_shard_req(Req) ->
     handle_reshard_req(Req).
@@ -382,3 +404,13 @@ validate_range(_Range) ->
 
 invalid_range() ->
     throw({bad_request, <<"Invalid `range`">>}).
+
+reservation_to_json(#{tag := Tag, node := Node, bytes := Bytes,
+                      created_at := CreatedAt, description := Desc}) ->
+    {[
+        {tag, iolist_to_binary(io_lib:format("~p", [Tag]))},
+        {node, atom_to_binary(Node, utf8)},
+        {bytes, Bytes},
+        {created_at, CreatedAt},
+        {description, Desc}
+    ]}.

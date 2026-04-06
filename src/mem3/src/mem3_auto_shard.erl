@@ -271,13 +271,22 @@ do_start_split(ShardName, Factor, State) ->
                 case check_floor_and_preflight(
                         SourceSize, Factor, AdjustedCaps) of
                     ok ->
-                        %% Reserve space on target nodes BEFORE starting
+                        %% Reserve space on target nodes BEFORE starting.
+                        %% Two layers: local state (cluster-wide tracking for
+                        %% our own pre-flight) + couch_space_monitor (shared
+                        %% with smoosh, manual reshard, manual compact).
                         SpaceFactor = config:get_integer(
                             "auto_shard", "min_free_space_factor", 3),
                         PerTarget = (SourceSize div Factor) * SpaceFactor,
                         NewReservations = add_reservations(
                             State#state.space_reservations,
                             TargetNodes, PerTarget),
+                        %% Also register with central space monitor for local node
+                        LocalTargets = [N || N <- TargetNodes, N =:= node()],
+                        lists:foreach(fun(_N) ->
+                            catch couch_space_monitor:reserve(
+                                {auto_split, ShardName}, node(), PerTarget)
+                        end, LocalTargets),
                         {Pid, _Ref} = spawn_monitor(fun() ->
                             MaxMs = config:get_integer(
                                 "auto_shard", "max_split_timeout_ms", 14400000),
@@ -351,6 +360,8 @@ handle_split_done(Pid, Reason, State) ->
             PerTarget = (SourceSize div Factor2) * SpaceFactor,
             NewReservations = release_reservations(
                 State#state.space_reservations, PerTarget, N * Factor2),
+            %% Also release from central space monitor
+            catch couch_space_monitor:release({auto_split, ShardName}),
             case Reason of
                 {split_result, ShardName, ok} ->
                     couch_log:notice(

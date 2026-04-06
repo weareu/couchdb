@@ -134,6 +134,8 @@ handle_info({'DOWN', Ref, _, Job, Reason}, #state{} = State) when
     Reason == noproc
 ->
     #state{active = Active, starting = Starting} = State,
+    %% Release space reservation for completed compaction
+    release_space_for_job(Active, Starting, Ref, Job),
     Active1 = maps:filter(fun(_, Pid) -> Pid =/= Job end, Active),
     Starting1 = maps:remove(Ref, Starting),
     State1 = State#state{active = Active1, starting = Starting1},
@@ -143,6 +145,7 @@ handle_info({'DOWN', Ref, _, Job, Reason}, #state{} = State) ->
     FoundActive = maps:filter(fun(_, Pid) -> Pid =:= Job end, Active),
     case maps:to_list(FoundActive) of
         [{Key, _Pid}] ->
+            release_space(Key),
             Active1 = maps:without([Key], Active),
             State1 = State#state{active = maps:without([Key], Active1)},
             State2 = maybe_remonitor_cpid(State1, Key, Reason),
@@ -150,6 +153,7 @@ handle_info({'DOWN', Ref, _, Job, Reason}, #state{} = State) ->
         [] ->
             case maps:take(Ref, Starting) of
                 {Key, Starting1} ->
+                    release_space(Key),
                     LogMsg = "~s : failed to start compaction of ~p: ~p",
                     LogArgs = [Name, smoosh_utils:stringify(Key), Reason],
                     couch_log:warning(LogMsg, LogArgs),
@@ -300,19 +304,31 @@ priority(#state{name = Name}, Key) ->
     end.
 
 try_compact(#state{name = Name} = State, Key) ->
-    try start_compact(State, Key) of
-        false ->
-            State;
-        #state{} = State1 ->
+    case maybe_reserve_space(Name, Key) of
+        {ok, ReservedBytes} ->
+            try start_compact(State, Key) of
+                false ->
+                    %% Compaction not started — release reservation
+                    release_space(Key),
+                    State;
+                #state{} = State1 ->
+                    Level = smoosh_utils:log_level("compaction_log_level", "notice"),
+                    LogMsg = "~s: Starting compaction for ~s (~B bytes reserved)",
+                    LogArgs = [Name, smoosh_utils:stringify(Key), ReservedBytes],
+                    couch_log:Level(LogMsg, LogArgs),
+                    State1
+            catch
+                Class:Exception ->
+                    release_space(Key),
+                    LogArgs = [Name, Class, Exception, smoosh_utils:stringify(Key)],
+                    couch_log:warning("~s: compaction error ~p:~p for ~s", LogArgs),
+                    State
+            end;
+        {error, Reason} ->
             Level = smoosh_utils:log_level("compaction_log_level", "notice"),
-            LogMsg = "~s: Starting compaction for ~s",
-            LogArgs = [Name, smoosh_utils:stringify(Key)],
+            LogMsg = "~s: Deferring compaction for ~s — insufficient space: ~p",
+            LogArgs = [Name, smoosh_utils:stringify(Key), Reason],
             couch_log:Level(LogMsg, LogArgs),
-            State1
-    catch
-        Class:Exception ->
-            LogArgs = [Name, Class, Exception, smoosh_utils:stringify(Key)],
-            couch_log:warning("~s: compaction error ~p:~p for ~s", LogArgs),
             State
     end.
 
@@ -496,6 +512,93 @@ suspend_pid(Pid) when is_pid(Pid) ->
 
 resume_pid(Pid) when is_pid(Pid) ->
     catch erlang:resume_process(Pid).
+
+%% ===================================================================
+%% Space reservation helpers
+%% ===================================================================
+
+%% @doc Reserve space before starting compaction.
+%% Returns {ok, ReservedBytes} or {error, Reason}.
+%% Disabled by default — set [smoosh] check_space_before_compact = true.
+maybe_reserve_space(ChannelName, Key) ->
+    case config:get_boolean("smoosh", "check_space_before_compact", false) of
+        false ->
+            {ok, 0};
+        true ->
+            EstBytes = estimate_compaction_size(ChannelName, Key),
+            Tag = compaction_tag(Key),
+            case EstBytes of
+                0 -> {ok, 0};
+                _ ->
+                    case couch_space_monitor:reserve(Tag, node(), EstBytes) of
+                        ok -> {ok, EstBytes};
+                        {error, _} = Err -> Err
+                    end
+            end
+    end.
+
+%% @doc Release space reservation for a compaction key.
+release_space(Key) ->
+    case config:get_boolean("smoosh", "check_space_before_compact", false) of
+        false -> ok;
+        true ->
+            Tag = compaction_tag(Key),
+            couch_space_monitor:release(Tag)
+    end.
+
+%% @doc Release space for a job found by DOWN handler.
+release_space_for_job(Active, Starting, Ref, Pid) ->
+    %% Find the key from active or starting maps
+    case maps:to_list(maps:filter(fun(_, P) -> P =:= Pid end, Active)) of
+        [{Key, _}] -> release_space(Key);
+        [] ->
+            case maps:get(Ref, Starting, undefined) of
+                undefined -> ok;
+                Key -> release_space(Key)
+            end
+    end.
+
+%% @doc Estimate how much space a compaction will consume.
+%% Compaction writes a new file while the old one still exists.
+%% Conservative estimate: current file size (new file could be as large).
+estimate_compaction_size(_ChannelName, {?INDEX_CLEANUP, _DbName}) ->
+    0;  % Cleanup only deletes, never creates
+estimate_compaction_size(_ChannelName, {Shard, GroupId}) ->
+    %% View compaction — estimate from view file size
+    try
+        {ok, Pid} = couch_index_server:get_index(couch_mrview_index, Shard, GroupId),
+        {ok, Info} = couch_index:get_info(Pid),
+        {SizeInfo} = couch_util:get_value(sizes, Info),
+        couch_util:get_value(file, SizeInfo, 0)
+    catch
+        _:_ -> 0
+    end;
+estimate_compaction_size(_ChannelName, DbName) when is_binary(DbName) ->
+    %% Database compaction — estimate from file size
+    try
+        case couch_db:open_int(DbName, []) of
+            {ok, Db} ->
+                try
+                    {ok, Info} = couch_db:get_db_info(Db),
+                    {SizeInfo} = couch_util:get_value(sizes, Info),
+                    couch_util:get_value(file, SizeInfo, 0)
+                after
+                    couch_db:close(Db)
+                end;
+            _ -> 0
+        end
+    catch
+        _:_ -> 0
+    end;
+estimate_compaction_size(_, _) ->
+    0.
+
+compaction_tag({?INDEX_CLEANUP, DbName}) ->
+    {index_cleanup, DbName};
+compaction_tag({Shard, GroupId}) ->
+    {view_compact, {Shard, GroupId}};
+compaction_tag(DbName) when is_binary(DbName) ->
+    {compaction, DbName}.
 
 -ifdef(TEST).
 

@@ -385,11 +385,17 @@ validate_and_start_job(#shard{} = Source, Split) ->
     end.
 
 handle_start_job(#job{} = Job, #state{state = running} = State) ->
-    case start_job_int(Job, State) of
+    case maybe_reserve_split_space(Job) of
         ok ->
-            {reply, {ok, Job#job.id}, State};
-        {error, Error} ->
-            {reply, {error, Error}, State}
+            case start_job_int(Job, State) of
+                ok ->
+                    {reply, {ok, Job#job.id}, State};
+                {error, Error} ->
+                    release_split_space(Job),
+                    {reply, {error, Error}, State}
+            end;
+        {error, SpaceErr} ->
+            {reply, {error, {insufficient_space, SpaceErr}}, State}
     end;
 handle_start_job(#job{} = Job, #state{state = stopped} = State) ->
     ok = mem3_reshard_store:store_job(State, Job),
@@ -524,6 +530,7 @@ kill_job_int(#job{pid = Pid, ref = Ref} = Job) ->
 
 -spec handle_job_exit(#job{}, term(), #state{}) -> ok.
 handle_job_exit(#job{split_state = completed} = Job, normal, State) ->
+    release_split_space(Job),
     couch_log:notice("~p completed job ~s exited", [?MODULE, Job#job.id]),
     Job1 = Job#job{
         pid = undefined,
@@ -537,6 +544,7 @@ handle_job_exit(#job{split_state = completed} = Job, normal, State) ->
     true = ets:insert(?MODULE, Job2),
     ok;
 handle_job_exit(#job{job_state = running} = Job, normal, _State) ->
+    release_split_space(Job),
     couch_log:notice("~p running job ~s stopped", [?MODULE, Job#job.id]),
     OldInfo = Job#job.state_info,
     Job1 = Job#job{
@@ -549,6 +557,7 @@ handle_job_exit(#job{job_state = running} = Job, normal, _State) ->
     true = ets:insert(?MODULE, update_job_history(Job1)),
     ok;
 handle_job_exit(#job{job_state = running} = Job, shutdown, _State) ->
+    release_split_space(Job),
     couch_log:notice("~p job ~s shutdown", [?MODULE, Job#job.id]),
     OldInfo = Job#job.state_info,
     Job1 = Job#job{
@@ -561,6 +570,7 @@ handle_job_exit(#job{job_state = running} = Job, shutdown, _State) ->
     true = ets:insert(?MODULE, update_job_history(Job1)),
     ok;
 handle_job_exit(#job{job_state = running} = Job, {shutdown, Msg}, _State) ->
+    release_split_space(Job),
     couch_log:notice("~p job ~s shutdown ~p", [?MODULE, Job#job.id, Msg]),
     OldInfo = Job#job.state_info,
     Job1 = Job#job{
@@ -573,6 +583,7 @@ handle_job_exit(#job{job_state = running} = Job, {shutdown, Msg}, _State) ->
     true = ets:insert(?MODULE, update_job_history(Job1)),
     ok;
 handle_job_exit(#job{} = Job, Error, State) ->
+    release_split_space(Job),
     couch_log:notice("~p job ~s failed ~p", [?MODULE, Job#job.id, Error]),
     OldInfo = Job#job.state_info,
     Job1 = Job#job{
@@ -845,3 +856,50 @@ statefmt(State) ->
 -spec jobfmt(#job{}) -> string().
 jobfmt(#job{} = Job) ->
     mem3_reshard_job:jobfmt(Job).
+
+%% ===================================================================
+%% Space reservation helpers for manual split
+%% ===================================================================
+
+%% @doc Reserve space for a manual split job via couch_space_monitor.
+%% Estimates 3x source shard size (data + compaction + index).
+maybe_reserve_split_space(#job{source = Source, id = Id}) ->
+    case config:get_boolean("smoosh", "check_space_before_compact", false) of
+        false -> ok;
+        true ->
+            Tag = {manual_split, Id},
+            EstBytes = estimate_split_size(Source),
+            case EstBytes of
+                0 -> ok;
+                _ ->
+                    case couch_space_monitor:reserve(Tag, node(), EstBytes) of
+                        ok -> ok;
+                        {error, _} = Err -> Err
+                    end
+            end
+    end.
+
+%% @doc Release space reservation for a manual split job.
+release_split_space(#job{id = Id}) ->
+    case config:get_boolean("smoosh", "check_space_before_compact", false) of
+        false -> ok;
+        true ->
+            Tag = {manual_split, Id},
+            couch_space_monitor:release(Tag)
+    end.
+
+estimate_split_size(#shard{name = Name}) ->
+    try
+        {ok, Db} = couch_db:open_int(Name, []),
+        try
+            {ok, Info} = couch_db:get_db_info(Db),
+            {SizeInfo} = couch_util:get_value(sizes, Info),
+            DiskSize = couch_util:get_value(file, SizeInfo, 0),
+            %% 3x: data copy + compaction headroom + index space
+            DiskSize * 3
+        after
+            couch_db:close(Db)
+        end
+    catch
+        _:_ -> 0
+    end.
