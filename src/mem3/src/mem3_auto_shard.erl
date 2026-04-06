@@ -130,6 +130,8 @@ init([]) ->
         scan_count = 0,
         splits_triggered = 0
     }),
+    %% Recover interrupted splits from previous run (like mem3_reshard reload_jobs)
+    erlang:send_after(5000, self(), recover_interrupted),
     {ok, schedule_scan(State)}.
 
 handle_call(status, _From, State) ->
@@ -171,6 +173,8 @@ handle_cast(_Msg, State) ->
 
 handle_info(scan, State) ->
     {noreply, schedule_scan(do_scan(State))};
+handle_info(recover_interrupted, State) ->
+    {noreply, recover_interrupted_splits(State)};
 handle_info({'DOWN', _Ref, process, Pid, Reason}, State) ->
     {noreply, handle_split_done(Pid, Reason, State)};
 handle_info(_Msg, State) ->
@@ -384,6 +388,36 @@ handle_split_done(Pid, Reason, State) ->
                 space_reservations = NewReservations
             }
     end.
+
+%% ===================================================================
+%% Crash recovery — handle interrupted splits from previous run
+%% ===================================================================
+
+%% @doc On startup, scan for interrupted splits and clean up or log.
+%% Same pattern as mem3_reshard:reload_jobs/1 — auto-cleanup targets
+%% from splits that died before shard map update, log those that were
+%% past map update for manual investigation.
+recover_interrupted_splits(State) ->
+    try
+        Interrupted = mem3_reshard_rep:find_interrupted_splits(),
+        case Interrupted of
+            [] -> ok;
+            _ ->
+                couch_log:notice(
+                    "mem3_auto_shard: found ~B interrupted splits from "
+                    "previous run, recovering...",
+                    [length(Interrupted)]),
+                lists:foreach(fun(Info) ->
+                    mem3_reshard_rep:cleanup_interrupted_split(Info)
+                end, Interrupted)
+        end
+    catch
+        _:Err ->
+            couch_log:warning(
+                "mem3_auto_shard: error during interrupted split recovery: ~p",
+                [Err])
+    end,
+    State.
 
 %% ===================================================================
 %% Coordinator election

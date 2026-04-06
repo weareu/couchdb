@@ -40,6 +40,7 @@
 
 -include_lib("mem3/include/mem3.hrl").
 -include_lib("couch/include/couch_db.hrl").
+-include_lib("mem3/include/mem3_reshard_rep.hrl").
 
 -export([
     split/3,
@@ -56,17 +57,14 @@
     verify_doc_distribution/3,
     preflight_check/3,
     delete_source/1,
-    create_replication_checkpoints/2
+    create_replication_checkpoints/2,
+    %% Checkpoint/restart/cleanup
+    checkpoint_state/2,
+    delete_checkpoint/1,
+    load_checkpoint/1,
+    find_interrupted_splits/0,
+    cleanup_interrupted_split/1
 ]).
-
--record(split_state, {
-    source :: #shard{},
-    targets :: [#shard{}],
-    target_map :: #{},
-    factor :: pos_integer(),
-    state :: atom(),
-    error :: term() | undefined
-}).
 
 %% ===================================================================
 %% Range subdivision
@@ -318,6 +316,8 @@ split(#shard{} = Source, Factor, TargetNodes) when
         [Factor, Source#shard.name]),
     Targets = build_targets(Source, Factor, TargetNodes),
     TMap = build_target_map(Targets),
+    TotalSteps = 13,
+    register_task(Source, Factor, TotalSteps),
     St = #split_state{
         source = Source,
         targets = Targets,
@@ -325,80 +325,108 @@ split(#shard{} = Source, Factor, TargetNodes) when
         factor = Factor,
         state = creating_targets
     },
-    run_split(St).
+    checkpoint_state(Source#shard.name, St),
+    try
+        Result = run_split(St),
+        delete_checkpoint(Source#shard.name),
+        Result
+    catch
+        Class:Reason:Stack ->
+            delete_checkpoint(Source#shard.name),
+            erlang:raise(Class, Reason, Stack)
+    end.
 
 run_split(#split_state{state = creating_targets} = St) ->
-    #split_state{targets = Targets} = St,
+    #split_state{source = Source, targets = Targets} = St,
+    update_task(1, <<"creating_targets">>),
     couch_log:notice("mem3_reshard_rep: creating ~B target DBs", [length(Targets)]),
     case create_target_dbs(Targets) of
         ok ->
-            run_split(St#split_state{state = replicating});
+            St1 = St#split_state{state = replicating},
+            checkpoint_state(Source#shard.name, St1),
+            run_split(St1);
         {error, Reason} ->
             {error, {creating_targets_failed, Reason}}
     end;
 
 run_split(#split_state{state = replicating} = St) ->
     #split_state{source = Source, target_map = TMap, targets = Targets} = St,
+    update_task(2, <<"replicating">>),
     couch_log:notice("mem3_reshard_rep: bulk replication from ~s", [Source#shard.name]),
     case replicate(Source, TMap, [{batch_size, 1000}, {batch_count, all}]) of
         ok ->
-            %% Create artificial mem3_rep checkpoints so that:
-            %% 1. Topoff phases resume from here (not from seq=0)
-            %% 2. After split, mem3_sync knows where targets left off
-            %%    (prevents massive re-replication storm)
             create_replication_checkpoints(Source, Targets),
-            run_split(St#split_state{state = topoff_1});
+            St1 = St#split_state{state = topoff_1},
+            checkpoint_state(Source#shard.name, St1),
+            run_split(St1);
         {error, Reason} ->
             cleanup_targets_on_failure(St),
             {error, {replication_failed, Reason}}
     end;
 
-run_split(#split_state{state = topoff_1} = St) ->
+run_split(#split_state{state = topoff_1, source = Src} = St) ->
+    update_task(3, <<"topoff_1">>),
     couch_log:notice("mem3_reshard_rep: topoff 1", []),
     case do_topoff(St) of
-        ok -> run_split(St#split_state{state = building_indices});
+        ok ->
+            St1 = St#split_state{state = building_indices},
+            checkpoint_state(Src#shard.name, St1),
+            run_split(St1);
         {error, _} = Err -> Err
     end;
 
-run_split(#split_state{state = building_indices} = St) ->
+run_split(#split_state{state = building_indices, source = Src} = St) ->
+    update_task(4, <<"building_indices">>),
     couch_log:notice("mem3_reshard_rep: warming up view indices on targets", []),
-    %% Proactive index warm-up. Not required — indices build on demand.
-    %% But warming up now means the first query after split is fast.
     build_indices(St#split_state.targets),
-    run_split(St#split_state{state = topoff_2});
+    St1 = St#split_state{state = topoff_2},
+    checkpoint_state(Src#shard.name, St1),
+    run_split(St1);
 
-run_split(#split_state{state = topoff_2} = St) ->
+run_split(#split_state{state = topoff_2, source = Src} = St) ->
+    update_task(5, <<"topoff_2">>),
     couch_log:notice("mem3_reshard_rep: topoff 2", []),
     case do_topoff(St) of
-        ok -> run_split(St#split_state{state = copying_local});
+        ok ->
+            St1 = St#split_state{state = copying_local},
+            checkpoint_state(Src#shard.name, St1),
+            run_split(St1);
         {error, _} = Err -> Err
     end;
 
 run_split(#split_state{state = copying_local} = St) ->
     #split_state{source = Source, target_map = TMap} = St,
+    update_task(6, <<"copying_local">>),
     couch_log:notice("mem3_reshard_rep: copying local docs", []),
     case copy_local_docs(Source, TMap) of
-        ok -> run_split(St#split_state{state = topoff_3});
+        ok ->
+            St1 = St#split_state{state = topoff_3},
+            checkpoint_state(Source#shard.name, St1),
+            run_split(St1);
         {error, _} = Err -> Err
     end;
 
-run_split(#split_state{state = topoff_3} = St) ->
+run_split(#split_state{state = topoff_3, source = Src} = St) ->
+    update_task(7, <<"topoff_3">>),
     couch_log:notice("mem3_reshard_rep: topoff 3", []),
     case do_topoff(St) of
-        ok -> run_split(St#split_state{state = updating_map});
+        ok ->
+            St1 = St#split_state{state = updating_map},
+            checkpoint_state(Src#shard.name, St1),
+            run_split(St1);
         {error, _} = Err -> Err
     end;
 
 run_split(#split_state{state = updating_map} = St) ->
     #split_state{source = Source, targets = Targets} = St,
+    update_task(8, <<"updating_map">>),
     couch_log:notice("mem3_reshard_rep: updating shard map", []),
     case update_shard_map(Source, Targets) of
-        ok -> run_split(St#split_state{state = topoff_post_map});
+        ok ->
+            St1 = St#split_state{state = topoff_post_map},
+            checkpoint_state(Source#shard.name, St1),
+            run_split(St1);
         {error, _} = Err ->
-            %% DO NOT cleanup targets — the shard map update may have
-            %% partially succeeded (doc written but propagation failed).
-            %% Deleting targets that clients may be routing to = DATA LOSS.
-            %% Leave both source and targets live. Operator investigates.
             couch_log:error(
                 "mem3_reshard_rep: shard map update failed for ~s. "
                 "Source and targets both remain. Manual investigation required.",
@@ -406,35 +434,39 @@ run_split(#split_state{state = updating_map} = St) ->
             Err
     end;
 
-%% After shard map update, clients start routing to targets.
-%% Any writes that hit the source during the propagation window
-%% must be caught by this topoff pass.
-run_split(#split_state{state = topoff_post_map} = St) ->
+run_split(#split_state{state = topoff_post_map, source = Src} = St) ->
+    update_task(9, <<"topoff_post_map">>),
     couch_log:notice("mem3_reshard_rep: post-map topoff (catching propagation writes)", []),
     case do_topoff(St) of
-        ok -> run_split(St#split_state{state = topoff_final});
+        ok ->
+            St1 = St#split_state{state = topoff_final},
+            checkpoint_state(Src#shard.name, St1),
+            run_split(St1);
         {error, _} = Err -> Err
     end;
 
-%% Second topoff after propagation settles — catches any writes that
-%% arrived at source during the first post-map topoff.
-run_split(#split_state{state = topoff_final} = St) ->
+run_split(#split_state{state = topoff_final, source = Src} = St) ->
+    update_task(10, <<"topoff_final">>),
     couch_log:notice("mem3_reshard_rep: final topoff", []),
     case do_topoff(St) of
-        ok -> run_split(St#split_state{state = verifying});
+        ok ->
+            St1 = St#split_state{state = verifying},
+            checkpoint_state(Src#shard.name, St1),
+            run_split(St1);
         {error, _} = Err -> Err
     end;
 
 run_split(#split_state{state = verifying} = St) ->
     #split_state{source = Source, targets = Targets} = St,
+    update_task(11, <<"verifying">>),
     couch_log:notice("mem3_reshard_rep: verifying consistency", []),
     TargetNames = [T#shard.name || T <- unique_range_targets(Targets)],
     case verify_consistency(Source#shard.name, TargetNames) of
         ok ->
-            run_split(St#split_state{state = deleting_source});
+            St1 = St#split_state{state = deleting_source},
+            checkpoint_state(Source#shard.name, St1),
+            run_split(St1);
         {error, Reason} ->
-            %% CRITICAL: Do NOT delete source if verification fails.
-            %% Leave both source and targets live. Alert operator.
             couch_log:error(
                 "mem3_reshard_rep: VERIFICATION FAILED for ~s: ~p. "
                 "Source NOT deleted. Manual intervention required.",
@@ -444,9 +476,11 @@ run_split(#split_state{state = verifying} = St) ->
 
 run_split(#split_state{state = deleting_source} = St) ->
     #split_state{source = Source} = St,
+    update_task(12, <<"deleting_source">>),
     couch_log:notice("mem3_reshard_rep: deleting source ~s", [Source#shard.name]),
     case delete_source(Source) of
         ok ->
+            update_task(13, <<"completed">>),
             couch_log:notice("mem3_reshard_rep: split completed for ~s",
                 [Source#shard.name]),
             ok;
@@ -739,4 +773,186 @@ verify_ranges_contiguous([[_B1, E1], [B2, E2] | Rest]) ->
     case B2 =:= E1 + 1 of
         true -> verify_ranges_contiguous([[B2, E2] | Rest]);
         false -> error({range_gap, E1, B2})
+    end.
+
+%% ===================================================================
+%% Task status — visible in /_active_tasks
+%% ===================================================================
+
+%% @doc Register this split as an active task (like compaction does).
+register_task(Source, Factor, TotalSteps) ->
+    try
+        couch_task_status:add_task([
+            {type, shard_split},
+            {database, Source#shard.name},
+            {split_factor, Factor},
+            {phase, <<"starting">>},
+            {progress, 0},
+            {changes_done, 0},
+            {total_changes, TotalSteps}
+        ]),
+        couch_task_status:set_update_frequency(1000)
+    catch
+        _:_ -> ok  % Task status not available (e.g. eunit)
+    end.
+
+%% @doc Update task progress. Step is 1-based, Phase is the state name.
+update_task(Step, Phase) ->
+    try
+        Progress = (Step * 100) div 13,
+        couch_task_status:update([
+            {phase, Phase},
+            {progress, min(Progress, 100)},
+            {changes_done, Step},
+            {total_changes, 13}
+        ])
+    catch
+        _:_ -> ok
+    end.
+
+%% ===================================================================
+%% Checkpoint persistence — survive restart
+%% ===================================================================
+
+%% @doc Write split state to a _local doc on the source shard.
+%% This allows resume/cleanup after crash or restart.
+%% Same pattern as compaction checkpoint files.
+-spec checkpoint_state(binary(), #split_state{}) -> ok.
+checkpoint_state(SourceName, #split_state{} = St) ->
+    DocId = checkpoint_doc_id(SourceName),
+    try
+        {ok, Db} = couch_db:open_int(SourceName, [?ADMIN_CTX]),
+        try
+            TargetNames = [T#shard.name || T <- St#split_state.targets],
+            Body = {[
+                {<<"type">>, <<"auto_split_checkpoint">>},
+                {<<"state">>, atom_to_binary(St#split_state.state, utf8)},
+                {<<"source">>, SourceName},
+                {<<"targets">>, TargetNames},
+                {<<"factor">>, St#split_state.factor},
+                {<<"updated_at">>, erlang:system_time(millisecond)}
+            ]},
+            Doc0 = #doc{id = DocId, body = Body},
+            Doc = case couch_db:open_doc(Db, DocId, []) of
+                {ok, #doc{revs = Revs}} -> Doc0#doc{revs = Revs};
+                {not_found, _} -> Doc0
+            end,
+            {ok, _} = couch_db:update_doc(Db, Doc, []),
+            ok
+        after
+            couch_db:close(Db)
+        end
+    catch
+        _:_ -> ok  % Best effort — don't fail the split if checkpoint fails
+    end.
+
+%% @doc Delete checkpoint after successful split completion.
+-spec delete_checkpoint(binary()) -> ok.
+delete_checkpoint(SourceName) ->
+    DocId = checkpoint_doc_id(SourceName),
+    try
+        {ok, Db} = couch_db:open_int(SourceName, [?ADMIN_CTX]),
+        try
+            case couch_db:open_doc(Db, DocId, []) of
+                {ok, #doc{revs = {_, Revs}}} ->
+                    {ok, _} = couch_db:delete_doc(Db, DocId, Revs),
+                    ok;
+                {not_found, _} ->
+                    ok
+            end
+        after
+            couch_db:close(Db)
+        end
+    catch
+        _:_ -> ok
+    end.
+
+%% @doc Load checkpoint from source shard (for resume after restart).
+-spec load_checkpoint(binary()) -> {ok, map()} | not_found.
+load_checkpoint(SourceName) ->
+    DocId = checkpoint_doc_id(SourceName),
+    try
+        {ok, Db} = couch_db:open_int(SourceName, [?ADMIN_CTX]),
+        try
+            case couch_db:open_doc(Db, DocId, [ejson_body]) of
+                {ok, #doc{body = {Props}}} ->
+                    {ok, #{
+                        state => binary_to_atom(
+                            couch_util:get_value(<<"state">>, Props), utf8),
+                        source => couch_util:get_value(<<"source">>, Props),
+                        targets => couch_util:get_value(<<"targets">>, Props, []),
+                        factor => couch_util:get_value(<<"factor">>, Props, 2),
+                        updated_at => couch_util:get_value(<<"updated_at">>, Props, 0)
+                    }};
+                {not_found, _} ->
+                    not_found
+            end
+        after
+            couch_db:close(Db)
+        end
+    catch
+        _:_ -> not_found
+    end.
+
+checkpoint_doc_id(SourceName) ->
+    <<"_local/auto_split_checkpoint_", SourceName/binary>>.
+
+%% @doc Scan all local shards for interrupted split checkpoints.
+%% Returns list of #{source, state, targets, factor} maps.
+-spec find_interrupted_splits() -> [map()].
+find_interrupted_splits() ->
+    try
+        {ok, AllDbs} = couch_server:all_databases(),
+        Shards = [Db || Db <- AllDbs, mem3_shard_size:is_shard(Db)],
+        lists:filtermap(fun(ShardName) ->
+            case load_checkpoint(ShardName) of
+                {ok, Info} -> {true, Info};
+                not_found -> false
+            end
+        end, Shards)
+    catch
+        _:_ -> []
+    end.
+
+%% @doc Clean up orphan target shards from an interrupted split.
+%% Only cleans targets that are NOT in the shard map (pre-map-update state).
+-spec cleanup_interrupted_split(map()) -> ok.
+cleanup_interrupted_split(#{source := SourceName, targets := TargetNames,
+                            state := SplitState}) ->
+    %% States before shard map update — safe to clean up targets
+    PreMapStates = [creating_targets, replicating, topoff_1, building_indices,
+                    topoff_2, copying_local, topoff_3],
+    case lists:member(SplitState, PreMapStates) of
+        true ->
+            couch_log:notice(
+                "mem3_reshard_rep: cleaning up ~B orphan targets from "
+                "interrupted split of ~s (was in state ~s)",
+                [length(TargetNames), SourceName, SplitState]),
+            lists:foreach(fun(TargetName) ->
+                try
+                    case couch_server:exists(TargetName) of
+                        true ->
+                            couch_log:notice(
+                                "mem3_reshard_rep: deleting orphan target ~s",
+                                [TargetName]),
+                            couch_server:delete(TargetName, [?ADMIN_CTX]);
+                        false ->
+                            ok
+                    end
+                catch
+                    _:_ -> ok
+                end
+            end, TargetNames),
+            %% Remove the checkpoint
+            delete_checkpoint(SourceName),
+            ok;
+        false ->
+            %% Post-map-update: targets may be live and serving traffic.
+            %% DO NOT delete. Log for operator investigation.
+            couch_log:warning(
+                "mem3_reshard_rep: interrupted split of ~s was past "
+                "shard map update (state: ~s). Targets left in place. "
+                "Manual verification required.",
+                [SourceName, SplitState]),
+            ok
     end.
