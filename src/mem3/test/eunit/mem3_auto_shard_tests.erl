@@ -308,3 +308,135 @@ t_scanner_skips_excluded_db() ->
             config:delete("auto_shard", "exclude_dbs", false)
         end
     end).
+
+%% ===================================================================
+%% 4. Space reservation — thundering herd prevention
+%% ===================================================================
+
+space_reservation_test_() ->
+    {
+        "Space reservation prevents thundering herd",
+        {
+            setup,
+            fun() -> {ok, Apps} = application:ensure_all_started(config), Apps end,
+            fun(_Apps) -> ok end,
+            [
+                fun t_add_reservations_accumulates/0,
+                fun t_subtract_reservations_reduces_free_space/0,
+                fun t_release_reservations_proportional/0,
+                fun t_reservation_blocks_preflight/0,
+                fun t_multiple_splits_exhaust_space/0,
+                fun t_release_cleans_zero_entries/0,
+                fun t_empty_reservations_passthrough/0
+            ]
+        }
+    }.
+
+t_add_reservations_accumulates() ->
+    ?_test(begin
+        R0 = #{},
+        %% First split reserves on 3 nodes, 10GB each
+        R1 = mem3_auto_shard:add_reservations(R0, [n1, n2, n3], 10000000000),
+        ?assertEqual(10000000000, maps:get(n1, R1)),
+        ?assertEqual(10000000000, maps:get(n2, R1)),
+        ?assertEqual(10000000000, maps:get(n3, R1)),
+        %% Second split adds more to same nodes
+        R2 = mem3_auto_shard:add_reservations(R1, [n1, n2, n3], 5000000000),
+        ?assertEqual(15000000000, maps:get(n1, R2)),
+        ?assertEqual(15000000000, maps:get(n2, R2)),
+        ?assertEqual(15000000000, maps:get(n3, R2))
+    end).
+
+t_subtract_reservations_reduces_free_space() ->
+    ?_test(begin
+        %% Simulate 3-node cluster, 100GB free on each
+        Caps = #{
+            n1 => #{dirs => [{"/data", 50, 100000000000, 200000000000}]},
+            n2 => #{dirs => [{"/data", 50, 100000000000, 200000000000}]},
+            n3 => #{dirs => [{"/data", 50, 100000000000, 200000000000}]}
+        },
+        %% Reserve 30GB on n1, 20GB on n2
+        Reservations = #{n1 => 30000000000, n2 => 20000000000},
+        Adjusted = mem3_auto_shard:subtract_reservations(Caps, Reservations),
+        %% n1 should have ~70GB free, n2 ~80GB, n3 still 100GB
+        [{_, _, N1Free, _}] = maps:get(dirs, maps:get(n1, Adjusted)),
+        [{_, _, N2Free, _}] = maps:get(dirs, maps:get(n2, Adjusted)),
+        [{_, _, N3Free, _}] = maps:get(dirs, maps:get(n3, Adjusted)),
+        ?assertEqual(70000000000, N1Free),
+        ?assertEqual(80000000000, N2Free),
+        ?assertEqual(100000000000, N3Free)
+    end).
+
+t_release_reservations_proportional() ->
+    ?_test(begin
+        %% 3 nodes with different reservation levels
+        R = #{n1 => 30000000000, n2 => 20000000000, n3 => 10000000000},
+        %% Release one split: 3 targets x 10GB each = 30GB total
+        R2 = mem3_auto_shard:release_reservations(R, 10000000000, 3),
+        %% Total was 60GB, releasing 30GB = 50% reduction
+        ?assert(maps:get(n1, R2, 0) < 30000000000),
+        ?assert(maps:get(n2, R2, 0) < 20000000000),
+        %% Total remaining should be ~30GB
+        Total = maps:fold(fun(_N, B, Acc) -> Acc + B end, 0, R2),
+        ?assert(Total =< 30000000000)
+    end).
+
+t_reservation_blocks_preflight() ->
+    ?_test(begin
+        %% Node with 50GB free, reservations eat 40GB → only 10GB effective
+        Caps = #{
+            n1 => #{dirs => [{"/data", 75, 50000000000, 200000000000}]}
+        },
+        Reservations = #{n1 => 40000000000},
+        Adjusted = mem3_auto_shard:subtract_reservations(Caps, Reservations),
+        [{_, _, AdjFree, _}] = maps:get(dirs, maps:get(n1, Adjusted)),
+        %% Only 10GB free after reservations
+        ?assertEqual(10000000000, AdjFree),
+        %% A 20GB shard split 2-way = 10GB targets, needs 3x = 30GB
+        %% Should FAIL because 10GB < 30GB
+        Result = mem3_reshard_rep:preflight_check(20000000000, 2, Adjusted),
+        ?assertMatch({error, {insufficient_space, _}}, Result)
+    end).
+
+t_multiple_splits_exhaust_space() ->
+    ?_test(begin
+        %% Scenario: 100GB free. 5 x 20GB shards want to split.
+        %% Each 2-way split needs 10GB target x 3 = 30GB reserved.
+        %% After 3 splits: 90GB reserved, only 10GB left → 4th must fail.
+        Caps = #{
+            n1 => #{dirs => [{"/data", 50, 100000000000, 200000000000}]}
+        },
+        R0 = #{},
+        %% Split 1: reserve 30GB
+        R1 = mem3_auto_shard:add_reservations(R0, [n1], 30000000000),
+        Adj1 = mem3_auto_shard:subtract_reservations(Caps, R1),
+        ?assertEqual(ok, mem3_reshard_rep:preflight_check(20000000000, 2, Adj1)),
+        %% Split 2: reserve another 30GB (total 60GB)
+        R2 = mem3_auto_shard:add_reservations(R1, [n1], 30000000000),
+        Adj2 = mem3_auto_shard:subtract_reservations(Caps, R2),
+        ?assertEqual(ok, mem3_reshard_rep:preflight_check(20000000000, 2, Adj2)),
+        %% Split 3: reserve another 30GB (total 90GB)
+        R3 = mem3_auto_shard:add_reservations(R2, [n1], 30000000000),
+        Adj3 = mem3_auto_shard:subtract_reservations(Caps, R3),
+        %% Now only 10GB free — 4th split of 20GB needs 30GB → FAIL
+        ?assertMatch({error, _},
+            mem3_reshard_rep:preflight_check(20000000000, 2, Adj3))
+    end).
+
+t_release_cleans_zero_entries() ->
+    ?_test(begin
+        %% Release all reservations → map should be empty
+        R = #{n1 => 10000000000},
+        R2 = mem3_auto_shard:release_reservations(R, 10000000000, 1),
+        ?assertEqual(#{}, R2)
+    end).
+
+t_empty_reservations_passthrough() ->
+    ?_test(begin
+        Caps = #{
+            n1 => #{dirs => [{"/data", 50, 100000000000, 200000000000}]}
+        },
+        %% Empty reservations should not change anything
+        Adjusted = mem3_auto_shard:subtract_reservations(Caps, #{}),
+        ?assertEqual(Caps, Adjusted)
+    end).

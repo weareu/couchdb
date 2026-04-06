@@ -46,7 +46,10 @@
     is_split_disabled_by_ddoc/1,
     is_coordinator/0,
     all_circuits_closed/0,
-    load_config_for_test/0
+    load_config_for_test/0,
+    subtract_reservations/2,
+    add_reservations/3,
+    release_reservations/3
 ]).
 
 %% gen_server callbacks
@@ -77,6 +80,11 @@
     protected_dbs :: [binary()],
     active_splits :: #{binary() => pid()},
     cooldowns :: #{binary() => non_neg_integer()},
+    %% Per-node space reservations for in-flight splits.
+    %% Prevents thundering herd: 50 oversized databases won't all
+    %% start splitting simultaneously and exhaust disk space.
+    %% Key = node(), Value = bytes reserved by active splits on that node.
+    space_reservations :: #{node() => non_neg_integer()},
     timer_ref :: undefined | reference(),
     scan_count :: non_neg_integer(),
     splits_triggered :: non_neg_integer()
@@ -118,6 +126,7 @@ init([]) ->
         paused = false,
         active_splits = #{},
         cooldowns = #{},
+        space_reservations = #{},
         scan_count = 0,
         splits_triggered = 0
     }),
@@ -133,6 +142,9 @@ handle_call(status, _From, State) ->
         active_splits => maps:size(State#state.active_splits),
         active_split_shards => maps:keys(State#state.active_splits),
         cooldowns_active => maps:size(State#state.cooldowns),
+        space_reserved_bytes => maps:fold(fun(_N, B, Acc) -> Acc + B end,
+            0, State#state.space_reservations),
+        space_reservations => State#state.space_reservations,
         scan_count => State#state.scan_count,
         splits_triggered => State#state.splits_triggered,
         is_coordinator => is_coordinator(),
@@ -216,6 +228,21 @@ start_splits([{ShardName, Size} | Rest], State) ->
     case do_start_split(ShardName, Factor2, State) of
         {ok, NewState} ->
             start_splits(Rest, NewState);
+        {error, {insufficient_space, _}} ->
+            %% Stop trying more splits — cluster is out of space.
+            %% No point checking remaining candidates this cycle.
+            couch_log:warning(
+                "mem3_auto_shard: stopping scan — insufficient cluster space. "
+                "~B candidates deferred to next cycle.",
+                [length(Rest) + 1]),
+            State;
+        {error, {below_free_floor, _}} ->
+            %% Hard floor hit — stop immediately.
+            couch_log:warning(
+                "mem3_auto_shard: stopping scan — node(s) below free space floor. "
+                "~B candidates deferred to next cycle.",
+                [length(Rest) + 1]),
+            State;
         {error, Reason} ->
             couch_log:warning(
                 "mem3_auto_shard: cannot split ~s: ~p",
@@ -226,19 +253,31 @@ start_splits([{ShardName, Size} | Rest], State) ->
 do_start_split(ShardName, Factor, State) ->
     try
         Shard = mem3_reshard:shard_from_name(ShardName),
+        SourceSize = byte_size_to_int(ShardName, State),
         N = config:get_integer("cluster", "n", 3),
         TargetNodes = mem3_node_capacity:best_nodes(
-            byte_size_to_int(ShardName, State) div Factor,
-            N * Factor, []),
+            SourceSize div Factor, N * Factor, []),
         case TargetNodes of
             [] ->
                 {error, no_target_nodes};
             _ ->
-                %% Pre-flight space check
+                %% Cluster-aware pre-flight: subtract space already reserved
+                %% by in-flight splits from available free space.
+                %% This prevents thundering herd: 50 oversized databases
+                %% won't all start splitting and exhaust disk.
                 Caps = mem3_node_capacity:all_capacities(),
-                case mem3_reshard_rep:preflight_check(
-                        byte_size_to_int(ShardName, State), Factor, Caps) of
+                AdjustedCaps = subtract_reservations(
+                    Caps, State#state.space_reservations),
+                case check_floor_and_preflight(
+                        SourceSize, Factor, AdjustedCaps) of
                     ok ->
+                        %% Reserve space on target nodes BEFORE starting
+                        SpaceFactor = config:get_integer(
+                            "auto_shard", "min_free_space_factor", 3),
+                        PerTarget = (SourceSize div Factor) * SpaceFactor,
+                        NewReservations = add_reservations(
+                            State#state.space_reservations,
+                            TargetNodes, PerTarget),
                         {Pid, _Ref} = spawn_monitor(fun() ->
                             MaxMs = config:get_integer(
                                 "auto_shard", "max_split_timeout_ms", 14400000),
@@ -254,13 +293,27 @@ do_start_split(ShardName, Factor, State) ->
                                 State#state.active_splits),
                             cooldowns = maps:put(DbName, Now,
                                 State#state.cooldowns),
+                            space_reservations = NewReservations,
                             splits_triggered = State#state.splits_triggered + 1
                         },
                         couch_log:notice(
-                            "mem3_auto_shard: started ~B-way split of ~s (~B bytes)",
-                            [Factor, ShardName, byte_size_to_int(ShardName, State)]),
+                            "mem3_auto_shard: started ~B-way split of ~s (~B bytes)"
+                            " [reserved ~B bytes/target on ~B nodes,"
+                            " total reserved: ~B bytes]",
+                            [Factor, ShardName, SourceSize,
+                             PerTarget, length(TargetNodes),
+                             maps:fold(fun(_N, B, Acc) -> Acc + B end,
+                                 0, NewReservations)]),
                         {ok, NewState};
                     {error, _} = Err ->
+                        couch_log:warning(
+                            "mem3_auto_shard: insufficient space to split ~s "
+                            "(~B bytes, factor ~B). "
+                            "Already reserved: ~B bytes cluster-wide. "
+                            "Will retry next scan cycle.",
+                            [ShardName, SourceSize, Factor,
+                             maps:fold(fun(_N, B, Acc) -> Acc + B end,
+                                 0, State#state.space_reservations)]),
                         Err
                 end
         end
@@ -284,10 +337,28 @@ handle_split_done(Pid, Reason, State) ->
             State;
         ShardName ->
             NewActive = maps:remove(ShardName, State#state.active_splits),
+            %% Release space reservations for this split.
+            %% We don't track which nodes each split reserved — release
+            %% proportional share by recalculating from remaining active splits.
+            %% Simpler: just release the reservation for this shard's size.
+            SourceSize = byte_size_to_int(ShardName, State),
+            SpaceFactor = config:get_integer(
+                "auto_shard", "min_free_space_factor", 3),
+            N = config:get_integer("cluster", "n", 3),
+            Factor = calculate_split_factor(
+                SourceSize, State#state.max_shard_size_bytes),
+            Factor2 = min(Factor, State#state.max_split_factor),
+            PerTarget = (SourceSize div Factor2) * SpaceFactor,
+            NewReservations = release_reservations(
+                State#state.space_reservations, PerTarget, N * Factor2),
             case Reason of
                 {split_result, ShardName, ok} ->
                     couch_log:notice(
-                        "mem3_auto_shard: split completed for ~s", [ShardName]);
+                        "mem3_auto_shard: split completed for ~s"
+                        " [released reservations, remaining: ~B bytes]",
+                        [ShardName,
+                         maps:fold(fun(_NN, B, Acc) -> Acc + B end,
+                             0, NewReservations)]);
                 {split_result, ShardName, {error, Err}} ->
                     couch_log:error(
                         "mem3_auto_shard: split FAILED for ~s: ~p",
@@ -297,7 +368,10 @@ handle_split_done(Pid, Reason, State) ->
                         "mem3_auto_shard: split process died for ~s: ~p",
                         [ShardName, Other])
             end,
-            State#state{active_splits = NewActive}
+            State#state{
+                active_splits = NewActive,
+                space_reservations = NewReservations
+            }
     end.
 
 %% ===================================================================
@@ -538,6 +612,7 @@ load_config_for_test() ->
         paused = false,
         active_splits = #{},
         cooldowns = #{},
+        space_reservations = #{},
         scan_count = 0,
         splits_triggered = 0
     }).
@@ -548,6 +623,108 @@ prune_cooldowns(#state{cooldowns = Cooldowns, cooldown_ms = CooldownMs} = State)
         (Now - LastSplit) < CooldownMs
     end, Cooldowns),
     State#state{cooldowns = Pruned}.
+
+%% ===================================================================
+%% Space checks
+%% ===================================================================
+
+%% @doc Combined check: hard floor + per-split preflight.
+%% The floor is a cluster-wide safety net — no split starts if any
+%% target node has less than min_free_floor_bytes free (after reservations).
+-spec check_floor_and_preflight(non_neg_integer(), pos_integer(), #{node() => map()}) ->
+    ok | {error, term()}.
+check_floor_and_preflight(SourceSize, Factor, AdjustedCaps) ->
+    FloorBytes = config:get_integer(
+        "auto_shard", "min_free_floor_bytes", 10000000000), % 10 GB default
+    case check_free_floor(AdjustedCaps, FloorBytes) of
+        ok ->
+            mem3_reshard_rep:preflight_check(SourceSize, Factor, AdjustedCaps);
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @doc Check that all nodes have at least FloorBytes free after reservations.
+-spec check_free_floor(#{node() => map()}, non_neg_integer()) ->
+    ok | {error, term()}.
+check_free_floor(AdjustedCaps, FloorBytes) ->
+    Problems = maps:fold(fun(Node, CapMap, Acc) ->
+        Dirs = maps:get(dirs, CapMap, []),
+        MaxFree = case Dirs of
+            [] -> 0;
+            _ -> lists:max([Free || {_Path, _Pct, Free, _Total} <- Dirs])
+        end,
+        case MaxFree >= FloorBytes of
+            true -> Acc;
+            false ->
+                [{Node, #{floor => FloorBytes, available => MaxFree}} | Acc]
+        end
+    end, [], AdjustedCaps),
+    case Problems of
+        [] -> ok;
+        _ -> {error, {below_free_floor, Problems}}
+    end.
+
+%% ===================================================================
+%% Space reservation helpers
+%% ===================================================================
+
+%% @doc Subtract reserved bytes from node capacities so pre-flight
+%% sees the effective free space, not the raw free space.
+-spec subtract_reservations(#{node() => map()}, #{node() => non_neg_integer()}) ->
+    #{node() => map()}.
+subtract_reservations(Caps, Reservations) ->
+    maps:map(fun(Node, CapMap) ->
+        Reserved = maps:get(Node, Reservations, 0),
+        case Reserved of
+            0 -> CapMap;
+            _ ->
+                Dirs = maps:get(dirs, CapMap, []),
+                %% Subtract reservation evenly across dirs on this node.
+                %% In practice most nodes have 1 data dir; for multi-dir,
+                %% split reservation proportionally by free space.
+                AdjDirs = subtract_from_dirs(Dirs, Reserved),
+                maps:put(dirs, AdjDirs, CapMap)
+        end
+    end, Caps).
+
+subtract_from_dirs([], _Reserved) -> [];
+subtract_from_dirs(Dirs, Reserved) ->
+    TotalFree = lists:sum([Free || {_P, _Pct, Free, _T} <- Dirs]),
+    case TotalFree of
+        0 -> Dirs;
+        _ ->
+            [{Path, Pct, max(0, Free - round(Reserved * Free / TotalFree)), Total}
+             || {Path, Pct, Free, Total} <- Dirs]
+    end.
+
+%% @doc Add space reservations for target nodes.
+-spec add_reservations(#{node() => non_neg_integer()}, [node()], non_neg_integer()) ->
+    #{node() => non_neg_integer()}.
+add_reservations(Reservations, TargetNodes, PerTarget) ->
+    lists:foldl(fun(Node, Acc) ->
+        Existing = maps:get(Node, Acc, 0),
+        maps:put(Node, Existing + PerTarget, Acc)
+    end, Reservations, TargetNodes).
+
+%% @doc Release reservations when a split completes (or fails).
+%% Since we don't track which specific nodes each split reserved on,
+%% release proportionally from all nodes that have reservations.
+-spec release_reservations(#{node() => non_neg_integer()}, non_neg_integer(), pos_integer()) ->
+    #{node() => non_neg_integer()}.
+release_reservations(Reservations, PerTarget, NumTargets) ->
+    TotalRelease = PerTarget * NumTargets,
+    TotalReserved = maps:fold(fun(_N, B, Acc) -> Acc + B end, 0, Reservations),
+    case TotalReserved of
+        0 -> #{};
+        _ ->
+            %% Release proportionally from each node
+            Released = maps:map(fun(_Node, NodeReserved) ->
+                Share = round(TotalRelease * NodeReserved / TotalReserved),
+                max(0, NodeReserved - Share)
+            end, Reservations),
+            %% Remove zero entries
+            maps:filter(fun(_N, B) -> B > 0 end, Released)
+    end.
 
 %% ===================================================================
 %% Glob matching
