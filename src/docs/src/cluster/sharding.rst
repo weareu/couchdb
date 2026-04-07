@@ -925,8 +925,15 @@ compaction, massive index rebuilds, and replication bottlenecks.
 
 .. code-block:: bash
 
-    # Check status
+    # Check status (includes active splits, space reservations, scan stats)
     $ curl -s $COUCH_URL:5984/_reshard/auto | jq .
+
+    # View ALL space reservations (auto-split, manual split, smoosh, compact)
+    $ curl -s $COUCH_URL:5984/_reshard/space | jq .
+
+    # Watch progress in /_active_tasks alongside compactions
+    $ curl -s $COUCH_URL:5984/_active_tasks | \
+        jq '.[] | select(.type == "shard_split")'
 
     # Trigger immediate scan
     $ curl -X POST $COUCH_URL:5984/_reshard/auto/scan
@@ -1023,19 +1030,78 @@ Check auto-shard status via HTTP:
         "enabled": true,
         "paused": false,
         "max_shard_size_bytes": 20000000000,
+        "scan_interval_ms": 600000,
+        "max_concurrent_splits": 2,
         "active_splits": 1,
         "active_split_shards": ["shards/00000000-ffffffff/bigdb.1234567890"],
+        "cooldowns_active": 0,
+        "space_reserved_bytes": 60000000000,
+        "space_reservations": {"node1@host": 60000000000},
         "scan_count": 42,
         "splits_triggered": 3,
-        "is_coordinator": true
+        "is_coordinator": true,
+        "maintenance_window": "always",
+        "exclude_patterns": ["_users", "_replicator"]
     }
 
 **Key metrics to watch:**
 
 - ``active_splits`` — number of splits currently running
+- ``space_reserved_bytes`` — total bytes reserved by in-flight splits
+- ``cooldowns_active`` — databases waiting in cooldown after split
 - ``scan_count`` — total scans performed (increasing = scanner is active)
 - ``splits_triggered`` — total splits started since node startup
 - ``is_coordinator`` — this node is running scans (only one per cluster)
+
+For the cluster-wide view of all space reservations (auto-split, manual
+split, compaction, view compaction, manual compact), query the central
+space monitor:
+
+.. code-block:: bash
+
+    $ curl -s $COUCH_URL:5984/_reshard/space | jq .
+    {
+        "total_reserved_bytes": 75000000000,
+        "reservation_count": 3,
+        "by_node": {
+            "node1@host": 60000000000,
+            "node2@host": 15000000000
+        },
+        "reservations": [
+            {
+                "tag": "{auto_split,<<\"shards/00-ff/bigdb.123\">>}",
+                "node": "node1@host",
+                "bytes": 60000000000,
+                "created_at": 1712534400123,
+                "description": "auto shard split: shards/00-ff/bigdb.123"
+            },
+            {
+                "tag": "{compaction,<<\"users\">>}",
+                "node": "node2@host",
+                "bytes": 15000000000,
+                "created_at": 1712534456789,
+                "description": "database compaction: users"
+            }
+        ]
+    }
+
+Crash Recovery
+~~~~~~~~~~~~~~
+
+Auto-shard splits write checkpoint state to ``_local`` docs on the source
+shard at every state transition. On node startup, ``mem3_auto_shard``
+scans local shards for these checkpoints (the same way compaction
+recovers from ``.compact.data`` files).
+
+- **Pre-map-update crash:** Orphan target shards are deleted, the
+  checkpoint is removed, and the next scan cycle re-splits the shard.
+- **Post-map-update crash:** Targets are preserved (they may already be
+  serving traffic). A warning is logged for operator investigation. The
+  source shard is **not** deleted until verification passes.
+
+Splits also auto-release space reservations when their process dies, so
+crashed splits do not leak reservations even if checkpoint recovery is
+not yet running.
 
 Troubleshooting
 ~~~~~~~~~~~~~~~
@@ -1064,3 +1130,18 @@ manually before deleting the source.
 
 **"Too many splits at once"** — Reduce ``max_concurrent_splits`` to 1.
 Increase ``cooldown_ms`` to space out operations.
+
+**"insufficient_space" errors in log** — Pre-flight check refused a split
+because cluster-wide free space (after subtracting in-flight reservations)
+is below the threshold. Check::
+
+    $ curl -s $COUCH_URL:5984/_reshard/space | jq .total_reserved_bytes
+
+If the reservation total is large, splits are queueing up. Either wait
+for them to complete or increase ``min_free_floor_bytes`` if you have
+verified safety margin.
+
+**"Auto-split scan deferred X candidates"** — The scanner found more
+oversized shards than space allows. Splits will resume next scan cycle
+as in-flight ones complete and release space. This is normal behavior
+under memory pressure and prevents disk exhaustion.

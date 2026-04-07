@@ -34,14 +34,15 @@ function StatusBadge({ enabled, paused }) {
 }
 
 export default function AutoShardLayout({
-  status, isLoading, error,
+  status, isLoading, error, space, tasks,
   loadStatus, toggleEnabled, togglePause, doTriggerScan, updateThreshold
 }) {
   const [thresholdGB, setThresholdGB] = useState('');
 
   useEffect(() => {
     loadStatus();
-    const interval = setInterval(() => loadStatus(), 15000);
+    // Refresh every 5s for live progress on active tasks + space
+    const interval = setInterval(() => loadStatus(), 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -155,19 +156,87 @@ export default function AutoShardLayout({
         </Col>
       </Row>
 
-      {/* Active splits detail */}
-      {status.active_splits > 0 && status.active_split_shards && (
+      {/* Active tasks (splits + compactions in one place) */}
+      {tasks && tasks.length > 0 && (
         <Card className="mb-4">
-          <Card.Header style={{ fontWeight: 'bold' }}>Active Splits</Card.Header>
+          <Card.Header style={{ fontWeight: 'bold' }}>
+            Active Tasks
+            <Badge bg="info" className="ms-2">{tasks.length}</Badge>
+          </Card.Header>
           <Card.Body>
             <Table striped size="sm">
               <thead>
-                <tr><th>Shard</th></tr>
+                <tr>
+                  <th>Type</th>
+                  <th>Database</th>
+                  <th>Phase</th>
+                  <th>Progress</th>
+                </tr>
               </thead>
               <tbody>
-                {status.active_split_shards.map((shard, i) =>
-                  <tr key={i}><td><code>{shard}</code></td></tr>
-                )}
+                {tasks.map((task, i) => (
+                  <tr key={i}>
+                    <td>
+                      <Badge bg={task.type === 'shard_split' ? 'primary' : 'secondary'}>
+                        {task.type}
+                      </Badge>
+                    </td>
+                    <td><code>{task.database || '-'}</code></td>
+                    <td>{task.phase || '-'}</td>
+                    <td>
+                      <div className="progress" style={{ height: '18px', minWidth: '120px' }}>
+                        <div
+                          className="progress-bar"
+                          role="progressbar"
+                          style={{ width: (task.progress || 0) + '%' }}
+                          aria-valuenow={task.progress || 0}
+                          aria-valuemin="0"
+                          aria-valuemax="100"
+                        >
+                          {task.progress || 0}%
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+          </Card.Body>
+        </Card>
+      )}
+
+      {/* Space reservations from couch_space_monitor */}
+      {space && space.reservation_count > 0 && (
+        <Card className="mb-4">
+          <Card.Header style={{ fontWeight: 'bold' }}>
+            Space Reservations
+            <Badge bg="warning" className="ms-2">
+              {formatBytes(space.total_reserved_bytes)} total
+            </Badge>
+          </Card.Header>
+          <Card.Body>
+            <p className="text-muted">
+              Cluster-wide disk space reserved by all in-flight operations
+              (auto-split, manual reshard, smoosh compaction, manual compact).
+              Reservations prevent thundering herd when many operations
+              run concurrently.
+            </p>
+            <Table striped size="sm">
+              <thead>
+                <tr>
+                  <th>Operation</th>
+                  <th>Node</th>
+                  <th>Reserved</th>
+                </tr>
+              </thead>
+              <tbody>
+                {space.reservations.map((r, i) => (
+                  <tr key={i}>
+                    <td>{r.description}</td>
+                    <td><code>{r.node}</code></td>
+                    <td>{formatBytes(r.bytes)}</td>
+                  </tr>
+                ))}
               </tbody>
             </Table>
           </Card.Body>

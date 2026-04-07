@@ -26,6 +26,13 @@ Shards can be split using the `/_reshard` API endpoint. Refer to a separate
 [README](README_reshard.md) regarding the technical detail on how shard
 splitting works.
 
+For **automatic** size-triggered shard splitting using internal replication
+(rather than the local file-copy approach used by `/_reshard`), see
+[README_auto_shard.md](README_auto_shard.md). Auto-splitting integrates
+with the central [`couch_space_monitor`](../couch/src/couch_space_monitor.erl)
+service so that compaction, manual reshard, and auto-split all share a
+single space-reservation budget and cannot collectively exhaust disk.
+
 ### Getting Started
 
 Mem3 requires R13B03 or higher and can be built with [rebar][2], which comes

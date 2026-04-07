@@ -52,3 +52,22 @@ export const resumeAutoShard = () => {
       return resp;
     });
 };
+
+// Fetch all space reservations from couch_space_monitor (auto-split,
+// manual reshard, smoosh compaction, manual compact)
+export const fetchSpaceReservations = () => {
+  return get(Helpers.getServerUrl('/_reshard/space'))
+    .then(resp => {
+      if (resp.error) throw new Error(resp.reason);
+      return resp;
+    });
+};
+
+// Fetch all active tasks (splits + compactions) for unified progress view
+export const fetchActiveTasks = () => {
+  return get(Helpers.getServerUrl('/_active_tasks'))
+    .then(resp => {
+      if (resp.error) throw new Error(resp.reason);
+      return resp;
+    });
+};

@@ -24,12 +24,21 @@ const initialState = {
     active_splits: 0,
     active_split_shards: [],
     cooldowns_active: 0,
+    space_reserved_bytes: 0,
+    space_reservations: {},
     scan_count: 0,
     splits_triggered: 0,
     is_coordinator: false,
     maintenance_window: 'always',
     exclude_patterns: []
-  }
+  },
+  space: {
+    total_reserved_bytes: 0,
+    reservation_count: 0,
+    by_node: {},
+    reservations: []
+  },
+  tasks: []
 };
 
 export default function autoshard(state = initialState, action) {
@@ -40,6 +49,10 @@ export default function autoshard(state = initialState, action) {
       return { ...state, isLoading: action.isLoading };
     case ActionTypes.AUTOSHARD_SET_ERROR:
       return { ...state, error: action.error, isLoading: false };
+    case ActionTypes.AUTOSHARD_SET_SPACE:
+      return { ...state, space: action.space };
+    case ActionTypes.AUTOSHARD_SET_TASKS:
+      return { ...state, tasks: action.tasks };
     default:
       return state;
   }
@@ -48,3 +61,5 @@ export default function autoshard(state = initialState, action) {
 export const getStatus = (state) => state.status;
 export const getIsLoading = (state) => state.isLoading;
 export const getError = (state) => state.error;
+export const getSpace = (state) => state.space;
+export const getTasks = (state) => state.tasks;

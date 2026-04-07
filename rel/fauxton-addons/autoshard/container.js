@@ -19,12 +19,20 @@ import {
   doTriggerScan,
   updateThreshold
 } from './actions';
-import { getStatus, getIsLoading, getError } from './reducers';
+import {
+  getStatus,
+  getIsLoading,
+  getError,
+  getSpace,
+  getTasks
+} from './reducers';
 
 const mapStateToProps = ({ autoshard }) => ({
   status: getStatus(autoshard),
   isLoading: getIsLoading(autoshard),
-  error: getError(autoshard)
+  error: getError(autoshard),
+  space: getSpace(autoshard),
+  tasks: getTasks(autoshard)
 });
 
 const mapDispatchToProps = (dispatch) => ({

@@ -17,7 +17,9 @@ import {
   updateAutoShardConfig,
   triggerScan,
   pauseAutoShard,
-  resumeAutoShard
+  resumeAutoShard,
+  fetchSpaceReservations,
+  fetchActiveTasks
 } from './api';
 
 export const setLoading = (isLoading) => ({
@@ -46,11 +48,54 @@ export const loadStatus = () => (dispatch) => {
       dispatch(setLoading(false));
       dispatch(setError(err.message));
     });
+  // Also fetch space reservations and active tasks for the unified panels
+  fetchSpaceReservations()
+    .then(space => dispatch({
+      type: ActionTypes.AUTOSHARD_SET_SPACE,
+      space
+    }))
+    .catch(() => {});
+  fetchActiveTasks()
+    .then(allTasks => {
+      const tasks = (allTasks || []).filter(t =>
+        t.type === 'shard_split' ||
+        t.type === 'database_compaction' ||
+        t.type === 'view_compaction' ||
+        t.type === 'indexer'
+      );
+      dispatch({
+        type: ActionTypes.AUTOSHARD_SET_TASKS,
+        tasks
+      });
+    })
+    .catch(() => {});
 };
 
 export const refreshStatus = () => (dispatch) => {
   fetchAutoShardStatus()
     .then(status => dispatch(setStatus(status)))
+    .catch(() => {});
+  // Also refresh space reservations and active tasks for unified view
+  fetchSpaceReservations()
+    .then(space => dispatch({
+      type: ActionTypes.AUTOSHARD_SET_SPACE,
+      space
+    }))
+    .catch(() => {});
+  fetchActiveTasks()
+    .then(allTasks => {
+      // Filter to shard splits + compactions for the unified panel
+      const tasks = (allTasks || []).filter(t =>
+        t.type === 'shard_split' ||
+        t.type === 'database_compaction' ||
+        t.type === 'view_compaction' ||
+        t.type === 'indexer'
+      );
+      dispatch({
+        type: ActionTypes.AUTOSHARD_SET_TASKS,
+        tasks
+      });
+    })
     .catch(() => {});
 };
 

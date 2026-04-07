@@ -190,10 +190,26 @@ Automatic Shard Splitting
         Multiplier for required free disk space before starting a split.
         Each target node must have at least this many times the target
         shard size free. Accounts for data, compaction headroom, and
-        index space. Default is 3::
+        index space. Default is 3.
+
+        This check is **cluster-aware** — space already reserved by
+        in-flight splits is subtracted from available free space, so
+        50 oversized databases cannot all start splitting simultaneously
+        and exhaust disk::
 
             [auto_shard]
             min_free_space_factor = 3
+
+    .. config:option:: min_free_floor_bytes :: Hard minimum free space floor
+
+        Hard floor (in bytes) for free space per node. Even if the
+        ``min_free_space_factor`` calculation would allow a split, no
+        split starts if any target node has less than this much free
+        space (after accounting for reservations from in-flight splits).
+        Set this to at least 2x ``max_shard_size_bytes``. Default 10 GB::
+
+            [auto_shard]
+            min_free_floor_bytes = 10000000000
 
     .. config:option:: weighted_placement :: Use capacity-weighted placement
 
@@ -233,9 +249,79 @@ Automatic Shard Splitting
 
     - Only one node (the coordinator) runs scans to prevent duplicate jobs
     - All circuit breakers must be closed (no splits during network partitions)
-    - Pre-flight disk space check before each split
-    - Mandatory consistency verification before source shard deletion
+    - Pre-flight disk space check before each split (cluster-aware)
+    - Hard free-space floor (``min_free_floor_bytes``) prevents splits when
+      disk is critically low, even if individual checks pass
+    - Liveness check on target nodes — splits do not start if target nodes
+      are not currently connected
+    - Mandatory consistency verification before source shard deletion (with
+      retry to handle races against concurrent writes)
     - If verification fails, source is NOT deleted and operator is alerted
+    - Splits are tracked in ``/_active_tasks`` with progress (1-13 phases)
+    - Splits checkpoint state to ``_local`` docs on the source shard so
+      they can be recovered or cleaned up after a node restart
+
+.. _config/space_monitor:
+
+Central Space Reservation
+=========================
+
+.. config:section:: space_monitor :: Cluster-Wide Space Reservation Service
+
+    CouchDB tracks space reservations across all disk-consuming operations
+    (compaction, shard splitting, view compaction, manual operations) via
+    a central ``couch_space_monitor`` ETS-backed gen_server. Every
+    operation that writes significant data registers its expected disk
+    usage **before** starting and releases it on completion.
+
+    This prevents thundering-herd scenarios where concurrent operations
+    collectively exhaust disk space — for example 50 oversized databases
+    all starting splits simultaneously, or smoosh starting compactions on
+    every database after a server restart.
+
+    Reservations are auto-released when the calling process dies (via
+    Erlang process monitors), so crashed operations do not leak space.
+
+    .. config:option:: enabled :: Master enable for all space checks
+
+        Master switch for space reservation checks across all components.
+        Individual components (smoosh, reshard) can override with their
+        own config keys. Default ``false``::
+
+            [space_monitor]
+            enabled = false
+
+    .. config:option:: min_free_floor_bytes :: Minimum free per node
+
+        Minimum free bytes that must remain on a node before
+        :erlang:`couch_space_monitor:reserve/3` will accept new
+        reservations. Default 10 GB::
+
+            [space_monitor]
+            min_free_floor_bytes = 10000000000
+
+.. config:section:: smoosh :: Smoosh Space Check Integration
+
+    .. config:option:: check_space_before_compact :: Check space before compacting
+
+        When ``true``, smoosh queries ``couch_space_monitor`` before
+        starting database or view compactions. Compactions are deferred
+        if insufficient space is available. Default ``false``::
+
+            [smoosh]
+            check_space_before_compact = false
+
+.. config:section:: reshard :: Manual Reshard Space Checks
+
+    .. config:option:: check_space_before_split :: Check space before manual split
+
+        When ``true``, manual shard splits via ``POST /_reshard/jobs``
+        check ``couch_space_monitor`` before reserving 3x source
+        size on the local node. Falls back to
+        ``[space_monitor] enabled`` if unset::
+
+            [reshard]
+            check_space_before_split = false
 
 Split Lifecycle
 ---------------
@@ -293,13 +379,23 @@ Each round triggers automatically at the next scan cycle after cooldown.
 Failure Recovery
 ----------------
 
+Auto-shard splits write checkpoint state to ``_local/auto_split_checkpoint_*``
+docs on the source shard at every state transition. On node startup,
+``mem3_auto_shard`` scans local shards for these checkpoints and recovers
+interrupted splits using the same logic as compaction file recovery.
+
 - **Crash before shard map update:** Target databases are cleaned up
-  automatically. No shard map change occurred, so clients are unaffected.
-  The split can be retried.
+  automatically by ``mem3_reshard_rep:cleanup_interrupted_split/1`` on
+  the next startup. No shard map change occurred, so clients are
+  unaffected. The shard is still oversized, so it will be re-split on
+  the next scan cycle.
 
 - **Crash after shard map update:** Target shards are live (clients are
-  already routing to them). The source shard is kept. The operator should
-  verify consistency manually and delete the source when satisfied.
+  already routing to them). The source shard is kept. The recovery code
+  logs a warning for operator investigation but does **not** delete
+  targets — that would risk data loss for clients already routing to them.
+  The operator should verify consistency manually and delete the source
+  when satisfied.
 
 - **Replication crash mid-transfer:** ``mem3_rep`` uses checkpointed
   replication. On retry, replication resumes from the last checkpoint,
@@ -311,8 +407,52 @@ Failure Recovery
   New scans are blocked until all circuits close.
 
 - **Disk fills during split:** The pre-flight check requires 3x target
-  shard size free. If disk fills despite this (due to other writes),
-  the replication will fail and targets are cleaned up.
+  shard size free, accounting for in-flight reservations. If disk fills
+  despite this (due to other writes), the replication will fail and
+  targets are cleaned up via the checkpoint recovery path.
+
+- **Verification race with writes:** Doc count verification retries up to
+  3 times with a 1 second delay if counts mismatch, to handle in-flight
+  writes that arrive between reading source and target counts.
+
+Active Task Visibility
+----------------------
+
+Shard splits register as tasks in ``/_active_tasks`` (the same place
+compactions appear) so operators can monitor progress alongside other
+background operations.
+
+.. code-block:: bash
+
+    $ curl -s $COUCH_URL:5984/_active_tasks | jq '.[] | select(.type == "shard_split")'
+    {
+        "type": "shard_split",
+        "database": "shards/00000000-ffffffff/bigdb.1234567890",
+        "split_factor": 4,
+        "phase": "replicating",
+        "progress": 15,
+        "changes_done": 2,
+        "total_changes": 13,
+        "started_on": 1712534400,
+        "updated_on": 1712534456,
+        "pid": "<0.1234.0>"
+    }
+
+The 13 phases (matching ``changes_done``) are:
+
+1. ``creating_targets``
+2. ``replicating``
+3. ``topoff_1``
+4. ``building_indices``
+5. ``topoff_2``
+6. ``copying_local``
+7. ``topoff_3``
+8. ``updating_map``
+9. ``topoff_post_map``
+10. ``topoff_final``
+11. ``verifying``
+12. ``deleting_source``
+13. ``completed``
 
 Tuning Guide
 ------------

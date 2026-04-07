@@ -2941,3 +2941,151 @@ You can verify the change by obtaining a list of UUIDs:
        {
             "ok": true
        }
+
+.. _api/server/reshard/auto:
+
+``/_reshard/auto``
+==================
+
+.. versionadded:: 3.6 (auto-shard fork)
+
+.. http:get:: /_reshard/auto
+
+    :synopsis: Returns the auto-shard splitting status, configuration, and
+               in-flight reservations on this node.
+
+    Returns the configuration and live status of the automatic shard
+    splitting subsystem. The auto-shard system periodically scans for
+    shards larger than ``max_shard_size_bytes`` and splits them via
+    internal replication (``mem3_rep``) without needing 2x source size
+    locally.
+
+    Server administrator privileges required.
+
+    :>header Content-Type: :mimetype:`application/json`
+
+    :>json boolean enabled: Master enable switch
+    :>json boolean paused: Whether scanning is currently paused
+    :>json number max_shard_size_bytes: Trigger threshold
+    :>json number max_concurrent_splits: Concurrency cap
+    :>json number active_splits: Number of splits currently running
+    :>json array active_split_shards: Names of shards being split
+    :>json number space_reserved_bytes: Total reserved bytes (auto-split only)
+    :>json object space_reservations: Per-node reserved bytes
+    :>json number cooldowns_active: Databases waiting in cooldown
+    :>json number scan_count: Total scans performed
+    :>json number splits_triggered: Total splits started
+    :>json boolean is_coordinator: Whether this node runs scans
+    :>json string maintenance_window: Allowed time window or ``always``
+
+    :code 200: Request completed successfully
+    :code 401: CouchDB Server Administrator privileges required
+
+.. http:put:: /_reshard/auto
+
+    :synopsis: Update auto-shard configuration at runtime.
+
+    Server administrator privileges required.
+
+    :<json boolean enabled: Enable or disable scanning
+    :<json number max_shard_size_bytes: New threshold (must be ≥ 1 GB)
+    :<json boolean paused: Pause or resume scanning
+
+    :code 200: Request completed successfully
+    :code 400: Invalid configuration value
+    :code 401: CouchDB Server Administrator privileges required
+
+.. http:post:: /_reshard/auto/scan
+
+    :synopsis: Trigger an immediate scan for oversized shards.
+
+    Forces the auto-shard scanner to run immediately rather than waiting
+    for the next ``scan_interval_ms``. Useful for testing configuration
+    changes or running on-demand after a manual cleanup.
+
+    :code 202: Scan triggered
+
+.. http:post:: /_reshard/auto/pause
+
+    :synopsis: Pause auto-shard scanning.
+
+    Pauses the periodic scanner. Already-running splits continue to
+    completion. Resume via :http:post:`/_reshard/auto/resume`.
+
+    :code 200: Paused
+
+.. http:post:: /_reshard/auto/resume
+
+    :synopsis: Resume auto-shard scanning.
+
+    :code 200: Resumed
+
+.. _api/server/reshard/space:
+
+``/_reshard/space``
+===================
+
+.. versionadded:: 3.6 (auto-shard fork)
+
+.. http:get:: /_reshard/space
+
+    :synopsis: View ALL active disk space reservations from auto-split,
+               manual reshard, smoosh, manual compaction, and other
+               disk-consuming operations.
+
+    Returns the cluster-wide view of disk space reservations from the
+    central ``couch_space_monitor`` service. Every operation that
+    consumes significant disk space registers a reservation **before**
+    starting and releases it on completion (or automatically via process
+    monitor on crash).
+
+    This is the canonical place to check why an operation was deferred
+    due to insufficient space.
+
+    Server administrator privileges required.
+
+    :>header Content-Type: :mimetype:`application/json`
+
+    :>json number total_reserved_bytes: Sum of all reservation bytes
+    :>json number reservation_count: Number of active reservations
+    :>json object by_node: Map of node name to reserved bytes
+    :>json array reservations: Detailed list of all reservations,
+                               each with ``tag``, ``node``, ``bytes``,
+                               ``created_at``, and ``description``
+
+    :code 200: Request completed successfully
+    :code 401: CouchDB Server Administrator privileges required
+
+    **Response**:
+
+    .. code-block:: http
+
+       HTTP/1.1 200 OK
+       Content-Type: application/json
+
+       {
+           "total_reserved_bytes": 75000000000,
+           "reservation_count": 2,
+           "by_node": {
+               "node1@host": 60000000000,
+               "node2@host": 15000000000
+           },
+           "reservations": [
+               {
+                   "tag": "{auto_split,<<\"shards/00-ff/bigdb.123\">>}",
+                   "node": "node1@host",
+                   "bytes": 60000000000,
+                   "created_at": 1712534400123,
+                   "description": "auto shard split: shards/00-ff/bigdb.123"
+               },
+               {
+                   "tag": "{compaction,<<\"users\">>}",
+                   "node": "node2@host",
+                   "bytes": 15000000000,
+                   "created_at": 1712534456789,
+                   "description": "database compaction: users"
+               }
+           ]
+       }
+
+    See also :ref:`config/space_monitor`.

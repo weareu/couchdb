@@ -39,6 +39,17 @@ for indexes that have been deleted. Defaults to true but may be switched to fals
 to allow time to observe the system and make a smarter decision about what 
 to compact first. Hardly ever changed from the default. Default 30 (seconds).
 </dd>
+<dt>check_space_before_compact</dt><dd>When <code>true</code>, smoosh
+queries <a href="../couch/src/couch_space_monitor.erl"><code>couch_space_monitor</code></a>
+before starting any database or view compaction. The estimated compaction
+size (current file size, since the worst case is no bloat to remove)
+is reserved on the local node. If insufficient space is available
+(after subtracting in-flight reservations from auto-split, manual reshard,
+manual compact, etc.), the compaction is deferred and re-enqueued.
+Reservations are auto-released via process monitor when the compaction
+finishes or crashes. Defaults to <code>false</code> (opt-in). Useful for
+clusters where multiple disk-consuming operations could collectively
+exhaust disk.</dd>
 </dl>
 
 Channel Settings
