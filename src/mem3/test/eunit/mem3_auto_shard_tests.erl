@@ -327,7 +327,11 @@ space_reservation_test_() ->
                 fun t_reservation_blocks_preflight/0,
                 fun t_multiple_splits_exhaust_space/0,
                 fun t_release_cleans_zero_entries/0,
-                fun t_empty_reservations_passthrough/0
+                fun t_empty_reservations_passthrough/0,
+                fun t_merge_reservations_preserves_existing/0,
+                fun t_subtract_reservations_map_exact/0,
+                fun t_overlapping_splits_no_drift/0,
+                fun t_multi_range_same_node_accumulates/0
             ]
         }
     }.
@@ -439,4 +443,80 @@ t_empty_reservations_passthrough() ->
         %% Empty reservations should not change anything
         Adjusted = mem3_auto_shard:subtract_reservations(Caps, #{}),
         ?assertEqual(Caps, Adjusted)
+    end).
+
+%% merge_reservations: takes a delta map of {node => bytes} and adds
+%% it onto an existing reservations map, summing per-node values.
+t_merge_reservations_preserves_existing() ->
+    ?_test(begin
+        Existing = #{n1 => 1000, n2 => 2000},
+        Delta = #{n1 => 500, n3 => 300},
+        Merged = mem3_auto_shard:merge_reservations(Existing, Delta),
+        ?assertEqual(1500, maps:get(n1, Merged)),
+        ?assertEqual(2000, maps:get(n2, Merged)),
+        ?assertEqual(300, maps:get(n3, Merged)),
+        ?assertEqual(3, maps:size(Merged))
+    end).
+
+%% subtract_reservations_map: releases EXACTLY what each split reserved
+%% on each node — no proportional math, no drift.
+t_subtract_reservations_map_exact() ->
+    ?_test(begin
+        Existing = #{n1 => 1500, n2 => 2000, n3 => 300},
+        ReleaseDelta = #{n1 => 500, n2 => 2000},
+        Result = mem3_auto_shard:subtract_reservations_map(Existing, ReleaseDelta),
+        %% n1: 1500 - 500 = 1000
+        ?assertEqual(1000, maps:get(n1, Result)),
+        %% n2: 2000 - 2000 = 0 → removed from map
+        ?assertEqual(error, maps:find(n2, Result)),
+        %% n3: untouched
+        ?assertEqual(300, maps:get(n3, Result))
+    end).
+
+%% Two overlapping splits: A reserves {n1=>100, n2=>100}, B reserves
+%% {n1=>50}. Releasing A must leave exactly {n1=>50} (B's reservation),
+%% with NO drift on n2. The legacy proportional release would have left
+%% phantom bytes here.
+t_overlapping_splits_no_drift() ->
+    ?_test(begin
+        %% Start with empty
+        R0 = #{},
+        %% Split A reserves
+        SplitA = #{n1 => 100, n2 => 100},
+        R1 = mem3_auto_shard:merge_reservations(R0, SplitA),
+        %% Split B reserves on n1 only
+        SplitB = #{n1 => 50},
+        R2 = mem3_auto_shard:merge_reservations(R1, SplitB),
+        ?assertEqual(150, maps:get(n1, R2)),
+        ?assertEqual(100, maps:get(n2, R2)),
+        %% Release split A using its EXACT per-node map
+        R3 = mem3_auto_shard:subtract_reservations_map(R2, SplitA),
+        %% Only B's 50 bytes on n1 should remain
+        ?assertEqual(50, maps:get(n1, R3)),
+        ?assertEqual(error, maps:find(n2, R3)),
+        %% Release split B
+        R4 = mem3_auto_shard:subtract_reservations_map(R3, SplitB),
+        ?assertEqual(#{}, R4)
+    end).
+
+%% Multi-range placement: a 4-way split where 2 ranges land on the
+%% same node (n1 appears twice in TargetNodes) must accumulate
+%% N * PerTarget bytes for that node — not just one PerTarget.
+t_multi_range_same_node_accumulates() ->
+    ?_test(begin
+        %% Simulate the do_start_split fold over TargetNodes where
+        %% n1 appears twice (multi-range on same node) and n2 once.
+        TargetNodes = [n1, n1, n2],
+        PerTarget = 1000,
+        PerNodeReservations = lists:foldl(
+            fun(Node, Acc) ->
+                maps:update_with(Node,
+                    fun(B) -> B + PerTarget end,
+                    PerTarget, Acc)
+            end, #{}, TargetNodes),
+        ?assertEqual(2000, maps:get(n1, PerNodeReservations)),
+        ?assertEqual(1000, maps:get(n2, PerNodeReservations)),
+        %% Total reserved must be 3 * PerTarget — every range slot
+        Total = maps:fold(fun(_, B, Acc) -> B + Acc end, 0, PerNodeReservations),
+        ?assertEqual(3 * PerTarget, Total)
     end).

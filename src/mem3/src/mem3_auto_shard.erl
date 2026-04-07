@@ -49,7 +49,9 @@
     load_config_for_test/0,
     subtract_reservations/2,
     add_reservations/3,
-    release_reservations/3
+    release_reservations/3,
+    merge_reservations/2,
+    subtract_reservations_map/2
 ]).
 
 %% gen_server callbacks
@@ -78,9 +80,11 @@
     paused :: boolean(),
     exclude_patterns :: [binary()],
     protected_dbs :: [binary()],
-    %% Key = ShardName, Value = {Pid, PerTarget, NumTargets}
-    %% Tracks exact reservation amount for clean release on completion.
-    active_splits :: #{binary() => {pid(), non_neg_integer(), pos_integer()}},
+    %% Key = ShardName, Value = {Pid, PerNodeReservations}
+    %% PerNodeReservations is a map of node() => bytes, recording the
+    %% EXACT amount this split reserved on each node. Releasing uses
+    %% this map directly — no proportional math, no drift.
+    active_splits :: #{binary() => {pid(), #{node() => non_neg_integer()}}},
     cooldowns :: #{binary() => non_neg_integer()},
     %% Per-node space reservations for in-flight splits.
     %% Prevents thundering herd: 50 oversized databases won't all
@@ -283,46 +287,60 @@ do_start_split(ShardName, Factor, State) ->
                 case check_floor_and_preflight(
                         SourceSize, Factor, AdjustedCaps) of
                     ok ->
-                        %% Reserve space on target nodes BEFORE starting.
-                        %% Two layers: local state (cluster-wide tracking for
-                        %% our own pre-flight) + couch_space_monitor (shared
-                        %% with smoosh, manual reshard, manual compact).
+                        %% Build a per-node reservation map from the actual
+                        %% TargetNodes list. If a node appears N times in
+                        %% TargetNodes (multi-range placement on the same
+                        %% node), it accrues N * PerTarget bytes.
                         SpaceFactor = config:get_integer(
                             "auto_shard", "min_free_space_factor", 3),
                         PerTarget = (SourceSize div Factor) * SpaceFactor,
-                        NewReservations = add_reservations(
-                            State#state.space_reservations,
-                            TargetNodes, PerTarget),
-                        %% Also register with central space monitor for local node
-                        LocalTargets = [N || N <- TargetNodes, N =:= node()],
-                        lists:foreach(fun(_N) ->
-                            catch couch_space_monitor:reserve(
-                                {auto_split, ShardName}, node(), PerTarget)
-                        end, LocalTargets),
+                        PerNodeReservations = lists:foldl(
+                            fun(Node, Acc) ->
+                                maps:update_with(Node,
+                                    fun(B) -> B + PerTarget end,
+                                    PerTarget, Acc)
+                            end, #{}, TargetNodes),
+                        NewReservations = merge_reservations(
+                            State#state.space_reservations, PerNodeReservations),
+                        %% Spawn the worker first; have IT register with
+                        %% couch_space_monitor. The reservation must be tied
+                        %% to the worker pid (so the space monitor's process
+                        %% monitor auto-releases on worker death), not to
+                        %% this gen_server.
+                        LocalBytes = maps:get(node(), PerNodeReservations, 0),
                         {Pid, _Ref} = spawn_monitor(fun() ->
+                            %% Reserve once with the total local bytes for
+                            %% this split (not per target slot).
+                            case LocalBytes > 0 of
+                                true ->
+                                    catch couch_space_monitor:reserve(
+                                        {auto_split, ShardName},
+                                        node(), LocalBytes);
+                                false -> ok
+                            end,
                             MaxMs = config:get_integer(
                                 "auto_shard", "max_split_timeout_ms", 14400000),
-                            {ok, TRef} = timer:exit_after(MaxMs, self(), split_timeout),
-                            Result = mem3_reshard_rep:split(Shard, Factor, TargetNodes),
+                            {ok, TRef} = timer:exit_after(
+                                MaxMs, self(), split_timeout),
+                            Result = mem3_reshard_rep:split(
+                                Shard, Factor, TargetNodes),
                             timer:cancel(TRef),
                             exit({split_result, ShardName, Result})
                         end),
-                        NumTargets = length(TargetNodes),
                         NewState = State#state{
                             active_splits = maps:put(ShardName,
-                                {Pid, PerTarget, NumTargets},
+                                {Pid, PerNodeReservations},
                                 State#state.active_splits),
                             space_reservations = NewReservations,
                             splits_triggered = State#state.splits_triggered + 1
                         },
                         couch_log:notice(
                             "mem3_auto_shard: started ~B-way split of ~s (~B bytes)"
-                            " [reserved ~B bytes/target on ~B nodes,"
-                            " total reserved: ~B bytes]",
+                            " [reserved ~B bytes total across ~B target slots]",
                             [Factor, ShardName, SourceSize,
-                             PerTarget, length(TargetNodes),
                              maps:fold(fun(_N, B, Acc) -> Acc + B end,
-                                 0, NewReservations)]),
+                                 0, PerNodeReservations),
+                             length(TargetNodes)]),
                         {ok, NewState};
                     {error, _} = Err ->
                         couch_log:warning(
@@ -349,43 +367,48 @@ byte_size_to_int(ShardName, _State) ->
 
 handle_split_done(Pid, Reason, State) ->
     %% Find which shard this pid was splitting
-    case maps:fold(fun(Shard, {P, _, _}, Acc) ->
+    case maps:fold(fun(Shard, {P, _}, Acc) ->
         case P =:= Pid of true -> Shard; false -> Acc end
     end, undefined, State#state.active_splits) of
         undefined ->
             State;
         ShardName ->
-            %% Use the exact reservation amounts stored at split start.
-            %% This avoids CRITICAL-3: recalculating from possibly-stale
-            %% shard size cache after timeout or source deletion.
-            {_Pid, PerTarget, NumTargets} = maps:get(ShardName,
+            %% Use the exact per-node reservation map stored at split
+            %% start. Subtract each node's bytes directly so concurrent
+            %% overlapping splits don't drift apart from reality.
+            {_Pid, PerNodeReservations} = maps:get(ShardName,
                 State#state.active_splits),
             NewActive = maps:remove(ShardName, State#state.active_splits),
-            NewReservations = release_reservations(
-                State#state.space_reservations, PerTarget, NumTargets),
-            %% Also release from central space monitor
+            NewReservations = subtract_reservations_map(
+                State#state.space_reservations, PerNodeReservations),
+            %% Release from central space monitor — best effort
+            %% (the worker process death also auto-releases via monitor).
             catch couch_space_monitor:release({auto_split, ShardName}),
             DbName = mem3:dbname(ShardName),
             Now = erlang:system_time(millisecond),
+            ReleasedTotal = maps:fold(fun(_, B, Acc) -> Acc + B end,
+                0, PerNodeReservations),
             case Reason of
                 {split_result, ShardName, ok} ->
                     couch_log:notice(
                         "mem3_auto_shard: split completed for ~s"
                         " [released ~B bytes, remaining: ~B bytes]",
-                        [ShardName, PerTarget * NumTargets,
+                        [ShardName, ReleasedTotal,
                          maps:fold(fun(_NN, B, Acc) -> Acc + B end,
                              0, NewReservations)]);
                 {split_result, ShardName, {error, Err}} ->
                     couch_log:error(
-                        "mem3_auto_shard: split FAILED for ~s: ~p",
-                        [ShardName, Err]);
+                        "mem3_auto_shard: split FAILED for ~s: ~p"
+                        " [released ~B bytes]",
+                        [ShardName, Err, ReleasedTotal]);
                 Other ->
                     couch_log:error(
-                        "mem3_auto_shard: split process died for ~s: ~p",
-                        [ShardName, Other])
+                        "mem3_auto_shard: split process died for ~s: ~p"
+                        " [released ~B bytes]",
+                        [ShardName, Other, ReleasedTotal])
             end,
-            %% HIGH-1 fix: set cooldown on COMPLETION, not start.
-            %% This gives the cluster time to stabilize AFTER the split.
+            %% Set cooldown on COMPLETION, not start.
+            %% Cluster gets stabilization time AFTER the split.
             State#state{
                 active_splits = NewActive,
                 space_reservations = NewReservations,
@@ -756,8 +779,9 @@ add_reservations(Reservations, TargetNodes, PerTarget) ->
     end, Reservations, TargetNodes).
 
 %% @doc Release reservations when a split completes (or fails).
-%% Since we don't track which specific nodes each split reserved on,
-%% release proportionally from all nodes that have reservations.
+%% LEGACY proportional release — kept for backward compatibility with
+%% existing tests. The new code path uses subtract_reservations_map/2
+%% which tracks exact per-node bytes and avoids drift.
 -spec release_reservations(#{node() => non_neg_integer()}, non_neg_integer(), pos_integer()) ->
     #{node() => non_neg_integer()}.
 release_reservations(Reservations, PerTarget, NumTargets) ->
@@ -766,14 +790,34 @@ release_reservations(Reservations, PerTarget, NumTargets) ->
     case TotalReserved of
         0 -> #{};
         _ ->
-            %% Release proportionally from each node
             Released = maps:map(fun(_Node, NodeReserved) ->
                 Share = round(TotalRelease * NodeReserved / TotalReserved),
                 max(0, NodeReserved - Share)
             end, Reservations),
-            %% Remove zero entries
             maps:filter(fun(_N, B) -> B > 0 end, Released)
     end.
+
+%% @doc Merge a per-node delta map into existing reservations.
+%% Used when starting a split to add the exact bytes per node.
+-spec merge_reservations(#{node() => non_neg_integer()}, #{node() => non_neg_integer()}) ->
+    #{node() => non_neg_integer()}.
+merge_reservations(Existing, Delta) ->
+    maps:fold(fun(Node, Bytes, Acc) ->
+        maps:update_with(Node, fun(B) -> B + Bytes end, Bytes, Acc)
+    end, Existing, Delta).
+
+%% @doc Subtract a per-node map from reservations.
+%% Used when a split completes/fails — releases EXACTLY what was reserved
+%% on each node, no proportional drift, no leak.
+-spec subtract_reservations_map(#{node() => non_neg_integer()},
+        #{node() => non_neg_integer()}) -> #{node() => non_neg_integer()}.
+subtract_reservations_map(Existing, Delta) ->
+    Updated = maps:fold(fun(Node, Bytes, Acc) ->
+        Current = maps:get(Node, Acc, 0),
+        New = max(0, Current - Bytes),
+        maps:put(Node, New, Acc)
+    end, Existing, Delta),
+    maps:filter(fun(_N, B) -> B > 0 end, Updated).
 
 %% ===================================================================
 %% Glob matching

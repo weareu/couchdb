@@ -160,7 +160,10 @@ handle_reshard_req(
     case mem3_reshard_api:get_job(JobId) of
         {ok, {Props}} ->
             NodeBin = couch_util:get_value(node, Props),
-            Node = binary_to_atom(NodeBin, utf8),
+            Node = try binary_to_existing_atom(NodeBin, utf8)
+                   catch error:badarg ->
+                       throw({bad_request, <<"Unknown node">>})
+                   end,
             case rpc:call(Node, mem3_reshard, remove_job, [JobId]) of
                 ok ->
                     send_json(Req, 200, {[{ok, true}]});
