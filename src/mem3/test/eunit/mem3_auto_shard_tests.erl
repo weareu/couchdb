@@ -45,7 +45,8 @@ ddoc_optout_test_() ->
                 fun t_ddoc_disabled_blocks_split/0,
                 fun t_ddoc_enabled_allows_split/0,
                 fun t_ddoc_with_other_fields_allows_split/0,
-                fun t_nonexistent_db_allows_split/0
+                fun t_nonexistent_db_allows_split/0,
+                fun t_ddoc_cache_survives_db_delete/0
             ]
         }
     }.
@@ -131,6 +132,32 @@ t_ddoc_with_other_fields_allows_split() ->
 t_nonexistent_db_allows_split() ->
     ?_assertEqual(false,
         mem3_auto_shard:is_split_disabled_by_ddoc(<<"nonexistent_db_xyz">>)).
+
+%% The ddoc cache returns its cached value for up to 60 seconds even
+%% after the underlying DB is deleted. This is the whole point of
+%% memoization: we don't want to re-open the DB on every candidate
+%% during a scan. Correctness: a freshly-deleted DB can't be split
+%% anyway (the shard will fail other checks first), so a stale
+%% "allowed" answer is harmless.
+t_ddoc_cache_survives_db_delete() ->
+    ?_test(begin
+        DbName = ?tempdb(),
+        {ok, Db} = couch_db:create(DbName, [?ADMIN_CTX]),
+        DDoc = #doc{
+            id = <<"_design/shard_config">>,
+            body = {[{<<"auto_split">>, {[{<<"enabled">>, false}]}}]}
+        },
+        {ok, _} = couch_db:update_doc(Db, DDoc, []),
+        couch_db:close(Db),
+        %% Prime the cache
+        ?assertEqual(true,
+            mem3_auto_shard:is_split_disabled_by_ddoc(DbName)),
+        %% Delete the database
+        ok = couch_server:delete(DbName, [?ADMIN_CTX]),
+        %% Cache still returns the old answer
+        ?assertEqual(true,
+            mem3_auto_shard:is_split_disabled_by_ddoc(DbName))
+    end).
 
 %% ===================================================================
 %% 2. Gen_server lifecycle — real process behavior
@@ -248,42 +275,46 @@ shard_scanning_test_() ->
 
 t_scanner_finds_oversized_shard() ->
     ?_test(begin
-        %% Create a shard and write enough data to exceed a tiny threshold
-        ShardName = <<"shards/00000000-ffffffff/scantest.1234567890">>,
+        %% Use a unique suffix so parallel runs don't collide
+        Suffix = integer_to_binary(erlang:system_time(millisecond)),
+        ShardName = <<"shards/00000000-ffffffff/scantest.", Suffix/binary>>,
         {ok, Db} = couch_db:create(ShardName, [?ADMIN_CTX]),
         couch_db:close(Db),
         try
-            %% Write data via replicated_changes
             {ok, Db1} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
             try
                 lists:foreach(fun(I) ->
                     Id = list_to_binary(io_lib:format("doc-~4..0B", [I])),
                     Rev = couch_hash:md5_hash(term_to_binary({Id, I})),
-                    Body = {[{<<"d">>, base64:encode(crypto:strong_rand_bytes(1024))}]},
+                    Body = {[{<<"d">>, base64:encode(
+                        crypto:strong_rand_bytes(1024))}]},
                     Doc = #doc{id = Id, body = Body, revs = {1, [Rev]}},
-                    {ok, _} = couch_db:update_docs(Db1, [Doc], [replicated_changes])
+                    {ok, _} = couch_db:update_docs(Db1, [Doc],
+                        [replicated_changes])
                 end, lists:seq(1, 50))
             after
                 couch_db:close(Db1)
             end,
+            %% Force a file flush by reopening the DB and reading info
+            {ok, Db2} = couch_db:open_int(ShardName, [?ADMIN_CTX]),
+            {ok, _} = couch_db:get_db_info(Db2),
+            couch_db:close(Db2),
 
-            %% Scan into ETS
             Table = ets:new(test_scan, [set, public]),
             try
                 mem3_shard_size:scan_local(Table),
-                case ets:lookup(Table, ShardName) of
-                    [{ShardName, Size, _}] ->
-                        %% Use a threshold smaller than the shard
-                        Oversized = ets:select(Table,
-                            [{{'$1', '$2', '_'}, [{'>', '$2', 1000}],
-                              [{{'$1', '$2'}}]}]),
-                        %% Our shard should be in the oversized list
-                        Found = [N || {N, _} <- Oversized, N =:= ShardName],
-                        ?assertEqual(1, length(Found));
-                    [] ->
-                        %% Shard not found — skip (write may not have flushed)
-                        ok
-                end
+                %% The scan MUST have found our shard. A silent skip
+                %% would mask real regressions in shard discovery.
+                Lookup = ets:lookup(Table, ShardName),
+                ?assertMatch([{ShardName, _, _}], Lookup),
+                [{ShardName, Size, _}] = Lookup,
+                ?assert(Size > 0),
+                %% Verify it appears in an oversized-select
+                Oversized = ets:select(Table,
+                    [{{'$1', '$2', '_'}, [{'>', '$2', 1000}],
+                      [{{'$1', '$2'}}]}]),
+                Found = [N || {N, _} <- Oversized, N =:= ShardName],
+                ?assertEqual(1, length(Found))
             after
                 ets:delete(Table)
             end

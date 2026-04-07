@@ -69,6 +69,11 @@
 -define(DEFAULT_MAX_SPLIT_FACTOR, 4).
 -define(DEFAULT_COOLDOWN_MS, 3600000).        % 1 hour
 
+%% ETS cache for ddoc opt-out lookups. Entries:
+%%   {{ddoc_cache, DbName}, Disabled, ExpiresAtMs}
+-define(CACHE_TABLE, mem3_auto_shard_ddoc_cache).
+-define(DDOC_CACHE_TTL_MS, 60000). % 1 minute
+
 -record(state, {
     enabled :: boolean(),
     max_shard_size_bytes :: pos_integer(),
@@ -131,6 +136,16 @@ set_threshold(Bytes) when is_integer(Bytes), Bytes > 0 ->
 %% ===================================================================
 
 init([]) ->
+    %% Create the ddoc cache table if it doesn't already exist.
+    %% Public so that is_split_disabled_by_ddoc/1 (a simple function,
+    %% not a gen_server call) can read and write it directly.
+    case ets:info(?CACHE_TABLE) of
+        undefined ->
+            ets:new(?CACHE_TABLE, [named_table, public, set,
+                {read_concurrency, true}]);
+        _ ->
+            ok
+    end,
     State = load_config(#state{
         paused = false,
         active_splits = #{},
@@ -553,19 +568,39 @@ is_legacy_reshard_active(ShardName) ->
     end.
 
 %% @doc Check if a database has auto-split disabled via design doc.
+%% Memoized with a short TTL to avoid re-opening every candidate DB
+%% on every scan cycle.
 -spec is_split_disabled_by_ddoc(binary()) -> boolean().
 is_split_disabled_by_ddoc(DbName) ->
+    Now = erlang:system_time(millisecond),
+    Key = {ddoc_cache, DbName},
+    case ets_lookup_cache(Key) of
+        {hit, Value, ExpiresAt} when ExpiresAt > Now ->
+            Value;
+        _ ->
+            Value = is_split_disabled_by_ddoc_uncached(DbName),
+            ExpiresAt = Now + ?DDOC_CACHE_TTL_MS,
+            catch ets:insert(?CACHE_TABLE, {Key, Value, ExpiresAt}),
+            Value
+    end.
+
+ets_lookup_cache(Key) ->
+    try ets:lookup(?CACHE_TABLE, Key) of
+        [{Key, Value, ExpiresAt}] -> {hit, Value, ExpiresAt};
+        [] -> miss
+    catch
+        error:badarg -> miss  % Table does not exist (test path)
+    end.
+
+is_split_disabled_by_ddoc_uncached(DbName) ->
     %% DbName might be a logical name ("mydb") or a shard name
     %% ("shards/00000000-ffffffff/mydb.1234567890").
-    %% We need to open ANY local shard of this database to read the ddoc.
+    %% Open ANY local shard of this database to read the ddoc.
     try
-        %% Try opening directly first (works for non-shard names in eunit)
         OpenName = case DbName of
             <<"shards/", _/binary>> ->
-                %% It's a shard name — use it directly
                 DbName;
             _ ->
-                %% Logical DB name — try to find a local shard
                 case catch mem3:shards(DbName) of
                     Shards when is_list(Shards), Shards =/= [] ->
                         LocalShards = [S || #shard{node = N} = S <- Shards,

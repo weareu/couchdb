@@ -54,40 +54,56 @@ teardown({Pid, _Apps}) ->
 
 t_collects_local_capacity(_) ->
     ?_test(begin
-        Caps = mem3_node_capacity:all_capacities(),
+        %% Force a synchronous refresh before reading so the capacity
+        %% scan is guaranteed to have run at least once, then assert
+        %% the local node is actually present. Silent skip on
+        %% "undefined" would mask real regressions in local collection.
+        ok = mem3_node_capacity:refresh(),
+        Caps = wait_for_local_capacity(10),
         ?assert(is_map(Caps)),
-        %% Local node should be present
-        case maps:get(node(), Caps, undefined) of
-            undefined ->
-                %% May not have couch_disk_monitor — acceptable in test
-                ok;
-            Cap ->
-                ?assert(is_map(Cap)),
-                ?assert(maps:is_key(dirs, Cap)),
-                ?assert(maps:is_key(shard_count, Cap)),
-                ?assert(maps:is_key(zone, Cap)),
-                %% shard_count should be a non-negative integer
-                SC = maps:get(shard_count, Cap),
-                ?assert(is_integer(SC) andalso SC >= 0)
-        end
+        Cap = maps:get(node(), Caps),
+        ?assert(is_map(Cap)),
+        ?assert(maps:is_key(dirs, Cap)),
+        ?assert(maps:is_key(shard_count, Cap)),
+        ?assert(maps:is_key(zone, Cap)),
+        SC = maps:get(shard_count, Cap),
+        ?assert(is_integer(SC) andalso SC >= 0)
     end).
 
 t_best_nodes_returns_current_node(_) ->
     ?_test(begin
-        %% In single-node test, best_nodes should return current node
+        ok = mem3_node_capacity:refresh(),
+        _ = wait_for_local_capacity(10),
+        %% With local capacity present, best_nodes(Bytes, 1, []) should
+        %% return EXACTLY the local node (we're single-node in eunit).
         Nodes = mem3_node_capacity:best_nodes(1000, 1, []),
-        ?assert(is_list(Nodes)),
-        %% Should contain at most 1 node (we asked for 1)
-        ?assert(length(Nodes) =< 1)
+        ?assertEqual([node()], Nodes)
     end).
 
 t_refresh_updates_data(_) ->
     ?_test(begin
         ok = mem3_node_capacity:refresh(),
-        timer:sleep(100),
-        %% Process should still be alive
+        _ = wait_for_local_capacity(10),
+        %% After refresh, all_capacities must contain the local node
+        %% with a populated updated_at timestamp.
+        Caps = mem3_node_capacity:all_capacities(),
+        Cap = maps:get(node(), Caps),
+        UpdatedAt = maps:get(updated_at, Cap, 0),
+        ?assert(is_integer(UpdatedAt) andalso UpdatedAt > 0),
         ?assert(is_pid(whereis(mem3_node_capacity)))
     end).
+
+%% Poll all_capacities until the local node is present or we time out.
+wait_for_local_capacity(0) ->
+    error({timeout, waiting_for_local_capacity});
+wait_for_local_capacity(Retries) ->
+    Caps = mem3_node_capacity:all_capacities(),
+    case maps:is_key(node(), Caps) of
+        true -> Caps;
+        false ->
+            timer:sleep(50),
+            wait_for_local_capacity(Retries - 1)
+    end.
 
 t_all_capacities_returns_map(_) ->
     ?_test(begin

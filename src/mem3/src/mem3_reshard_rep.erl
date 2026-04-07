@@ -584,8 +584,32 @@ cleanup_targets_on_failure(#split_state{targets = Targets}) ->
         catch couch_server:delete(Name, [?ADMIN_CTX])
     end, UniqueTargets).
 
-do_topoff(#split_state{source = Source, target_map = TMap}) ->
-    topoff(Source, TMap, [{batch_size, 500}, {batch_count, all}]).
+do_topoff(#split_state{} = St) ->
+    do_topoff(St, 3).
+
+%% @doc Run a topoff round with bounded retries for transient errors.
+%% Topoff uses mem3_rep which is already checkpointed, so a retry
+%% resumes from where the previous attempt left off rather than
+%% re-replicating from scratch.
+do_topoff(#split_state{source = Source, target_map = TMap} = St, Retries)
+  when Retries > 0 ->
+    case topoff(Source, TMap, [{batch_size, 500}, {batch_count, all}]) of
+        ok ->
+            ok;
+        {error, Reason} when Retries > 1 ->
+            couch_log:warning(
+                "mem3_reshard_rep: topoff for ~s failed (~p), "
+                "~B retries remaining",
+                [Source#shard.name, Reason, Retries - 1]),
+            timer:sleep(backoff_ms(Retries)),
+            do_topoff(St, Retries - 1);
+        {error, _} = Err ->
+            Err
+    end.
+
+backoff_ms(3) -> 1000;
+backoff_ms(2) -> 3000;
+backoff_ms(_) -> 5000.
 
 %% ===================================================================
 %% Split operations

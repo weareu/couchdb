@@ -996,21 +996,25 @@ t_view_query_returns_data_on_target() ->
 
             case TargetWithDDoc of
                 [#shard{name = TName} | _] ->
-                    %% Query the view — should return rows
+                    %% Query the view and assert actual rows came back
                     {ok, TDb} = couch_db:open_int(TName, [?ADMIN_CTX]),
                     try
                         {ok, DDoc} = couch_db:open_doc(TDb,
                             <<"_design/test_view">>, []),
-                        %% Trigger index build
-                        catch couch_mrview:query_view(TDb, DDoc,
-                            <<"by_n">>, [{limit, 1}]),
-                        %% If we get here without crash, views work
-                        ok
+                        QueryResult = couch_mrview:query_view(
+                            TDb, DDoc, <<"by_n">>,
+                            [{limit, 10}, {reduce, false}]),
+                        ?assertMatch({ok, _, _, _}, QueryResult),
+                        {ok, _, _, Rows} = QueryResult,
+                        %% The target must contain at least one doc
+                        %% under its hash range, so the view must
+                        %% return at least one row. If it does not,
+                        %% view indexing is broken.
+                        ?assert(length(Rows) >= 1)
                     after
                         couch_db:close(TDb)
                     end;
                 [] ->
-                    %% Design doc must exist in at least one target
                     error({design_doc_not_found_in_any_target,
                            <<"_design/test_view">>})
             end

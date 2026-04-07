@@ -79,18 +79,23 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-%% @doc Reserve space on a node. Returns ok if the node has sufficient
-%% free space (after subtracting existing reservations), or
-%% {error, {insufficient_space, Available, Requested}} if not.
+%% @doc Reserve space on the LOCAL node. Returns ok if the node has
+%% sufficient free space (after subtracting existing reservations),
+%% or {error, {insufficient_space, Info}} if not.
 %%
-%% The reservation is monitored — if the calling process dies, the
+%% Only local-node reservations are supported. Remote-node bookkeeping
+%% is the responsibility of mem3_node_capacity, which tracks capacity
+%% across the cluster via RPC. Attempting to reserve on a remote node
+%% always fails because raw_free/1 returns 0 for remote nodes by design.
+%%
+%% The reservation is monitored: if the calling process dies, the
 %% reservation is automatically released.
 %%
 %% Tag must be unique. Duplicate tags return {error, already_reserved}.
 %%
-%% Examples:
+%% Examples (all local-node):
 %%   reserve({compaction, <<"mydb">>}, node(), 1073741824)
-%%   reserve({auto_split, <<"shards/00-ff/db.123">>}, 'n1@host', 60000000000)
+%%   reserve({auto_split, <<"shards/00-ff/db.123">>}, node(), 60000000000)
 %%   reserve({manual_compact, <<"mydb">>}, node(), 5368709120)
 -spec reserve(term(), node(), non_neg_integer()) ->
     ok | {error, term()}.

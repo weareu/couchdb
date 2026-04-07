@@ -298,35 +298,43 @@ t_starvation_exactly_k_succeed() ->
     ChunkSize = max(1, RawFree div 10),
     Self = self(),
     N = 20,
-    Pids = [spawn(fun() ->
-        Tag = {starve, I, make_ref()},
-        Result = couch_space_monitor:reserve(Tag, node(), ChunkSize),
-        Self ! {result, I, Tag, Result},
-        %% Hold reservation until told to die
-        receive die -> ok end
-    end) || I <- lists:seq(1, N)],
+    %% Spawn each process and track {Pid, Index} so we can
+    %% correlate the later {result, ...} messages by index.
+    PidIdxList = [begin
+        Idx = I,
+        Pid = spawn(fun() ->
+            Tag = {starve, Idx, make_ref()},
+            Result = couch_space_monitor:reserve(Tag, node(), ChunkSize),
+            Self ! {result, Idx, self(), Tag, Result},
+            receive die -> ok end
+        end),
+        {Idx, Pid}
+    end || I <- lists:seq(1, N)],
 
-    %% Collect results
-    Results = [receive {result, I, Tag, R} -> {I, Tag, R}
+    %% Collect {Idx, Pid, Tag, Result} tuples in message-arrival order.
+    %% No zip against Pids — the arrival order is not guaranteed to
+    %% match spawn order, so a zip mismatches pids with results.
+    Results = [receive
+                   {result, I, P, T, R} -> {I, P, T, R}
                after 5000 -> error({timeout, I})
                end || I <- lists:seq(1, N)],
 
-    Successes = [R || {_, _, ok} = R <- Results],
-    Failures = [R || {_, _, {error, _}} = R <- Results],
-
-    %% At least 1 should succeed, at least 1 should fail
+    Successes = [R || {_, _, _, ok} = R <- Results],
+    Failures = [R || {_, _, _, {error, _}} = R <- Results],
     ?assert(length(Successes) >= 1),
     ?assert(length(Failures) >= 1),
-    %% Successes should be ~10 (within margin for rounding)
     ?assert(length(Successes) =< 11),
 
-    %% Clean up
+    %% Release and signal every successful reservation's owning pid.
     [begin
         couch_space_monitor:release(Tag),
-        Pid ! die
-    end || {Pid, {_, Tag, ok}} <- lists:zip(Pids, Results), is_pid(Pid)],
-    %% Kill remaining
-    [Pid ! die || Pid <- Pids],
+        P ! die
+    end || {_I, P, Tag, ok} <- Results],
+    %% Signal any remaining (failed) processes by their tracked pid.
+    [P ! die || {_I, P} <- PidIdxList,
+                not lists:any(fun({_, P2, _, ok}) -> P2 =:= P;
+                                 (_) -> false
+                              end, Results)],
     timer:sleep(100).
 
 %% Release in sequence → each release allows the next waiter
@@ -469,7 +477,9 @@ t_auto_shard_subtract_reduces_effective() ->
     [{_, _, Free2, _}] = maps:get(dirs, maps:get(node(), Adj2)),
     ?assertEqual(0, Free2).
 
-%% Multi-directory: reservation splits proportionally across dirs
+%% Multi-directory: subtract_reservations deducts from the LARGEST
+%% dir (the one placement would pick), not proportionally across
+%% every dir. See mem3_auto_shard:subtract_from_dirs/2.
 t_auto_shard_multi_dir_proportional() ->
     Caps = #{
         node() => #{dirs => [
@@ -477,15 +487,16 @@ t_auto_shard_multi_dir_proportional() ->
             {"/data2", 60, 40000000000, 100000000000}
         ]}
     },
-    %% Reserve 20GB → should split 12GB from data1, 8GB from data2
-    %% (proportional to free space: 60/100 * 20 = 12, 40/100 * 20 = 8)
+    %% Reserve 20GB — subtracted entirely from the largest dir
+    %% (data1: 60GB free), leaving data1 at 40GB and data2 untouched.
     Res = #{node() => 20000000000},
     Adj = mem3_auto_shard:subtract_reservations(Caps, Res),
     Dirs = maps:get(dirs, maps:get(node(), Adj)),
-    [{"/data1", _, Free1, _}, {"/data2", _, Free2, _}] = Dirs,
-    ?assertEqual(48000000000, Free1),  % 60 - 12 = 48
-    ?assertEqual(32000000000, Free2),  % 40 - 8 = 32
-    %% Total free should be 80GB (100 - 20)
+    Sorted = lists:keysort(1, Dirs),
+    [{"/data1", _, Free1, _}, {"/data2", _, Free2, _}] = Sorted,
+    ?assertEqual(40000000000, Free1),
+    ?assertEqual(40000000000, Free2),
+    %% Total free is still 80 GB (100 - 20)
     ?assertEqual(80000000000, Free1 + Free2).
 
 %% ===================================================================
