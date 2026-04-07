@@ -102,22 +102,26 @@ t_reservations_accumulate() ->
 t_process_death_auto_releases() ->
     Tag = {test_death, make_ref()},
     Self = self(),
-    %% Spawn a process that reserves and signals us
     Pid = spawn(fun() ->
         ok = couch_space_monitor:reserve(Tag, node(), 5000),
         Self ! reserved,
         receive die -> ok end
     end),
     receive reserved -> ok after 5000 -> error(timeout) end,
-    %% Verify reservation exists
     ?assert(couch_space_monitor:reserved_on(node()) >= 5000),
-    %% Kill the process
+    %% Monitor the reserving process so we know when it has
+    %% actually exited (cheap and deterministic). The space monitor
+    %% receives the same DOWN but we can't monitor its internal
+    %% release message, so still wait_for the reservation to be gone.
+    Ref = monitor(process, Pid),
     Pid ! die,
-    timer:sleep(100),  % Allow DOWN message to propagate
-    %% Reservation should be auto-released
-    Reservations = couch_space_monitor:reservations(),
-    TagFound = [R || R <- Reservations, maps:get(tag, R) =:= Tag],
-    ?assertEqual([], TagFound),
+    receive {'DOWN', Ref, process, Pid, _} -> ok
+    after 2000 -> error(process_did_not_exit)
+    end,
+    ok = wait_for(fun() ->
+        Reservations = couch_space_monitor:reservations(),
+        [] =:= [R || R <- Reservations, maps:get(tag, R) =:= Tag]
+    end, 100, 20),
     ok.
 
 t_status_reflects_reservations() ->
@@ -162,16 +166,32 @@ t_effective_free_math() ->
     ok.
 
 t_concurrent_reserve_release() ->
-    %% 10 processes each reserve and release — no crashes
+    %% 10 processes each reserve and release — no crashes, and the
+    %% reserved total must return to its starting value once all
+    %% workers have released.
+    Before = couch_space_monitor:total_reserved(),
     Self = self(),
-    Pids = [spawn(fun() ->
+    _Pids = [spawn(fun() ->
         Tag = {concurrent, I, make_ref()},
         ok = couch_space_monitor:reserve(Tag, node(), 100),
-        timer:sleep(10),
         couch_space_monitor:release(Tag),
         Self ! {done, I}
     end) || I <- lists:seq(1, 10)],
-    %% Wait for all
     [receive {done, I} -> ok after 5000 -> error({timeout, I}) end
      || I <- lists:seq(1, 10)],
+    %% After all releases, total must be back to baseline.
+    ?assertEqual(Before, couch_space_monitor:total_reserved()),
     ok.
+
+%% Poll Fun until it returns true, up to RetriesLeft attempts,
+%% sleeping IntervalMs between attempts. Returns ok on success,
+%% {error, timeout} on failure.
+wait_for(_Fun, _IntervalMs, 0) ->
+    error(wait_for_timeout);
+wait_for(Fun, IntervalMs, RetriesLeft) ->
+    case Fun() of
+        true -> ok;
+        false ->
+            timer:sleep(IntervalMs),
+            wait_for(Fun, IntervalMs, RetriesLeft - 1)
+    end.

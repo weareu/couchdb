@@ -41,7 +41,10 @@ setup() ->
     {ok, Apps} = application:ensure_all_started(config),
     ok = config:set("auto_shard", "capacity_scan_interval_ms", "300000", false),
     {ok, Pid} = mem3_node_capacity:start_link(),
-    timer:sleep(100), % Let initial scan complete
+    %% sys:get_state is a synchronous gen_server barrier — by the
+    %% time it returns, init/1 has completed and the initial scan
+    %% has run. No timer:sleep required.
+    _ = sys:get_state(mem3_node_capacity),
     {Pid, Apps}.
 
 teardown({Pid, _Apps}) ->

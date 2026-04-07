@@ -171,12 +171,20 @@ t_death_unblocks_next() ->
     ?assertMatch({error, _},
         couch_space_monitor:reserve(Tag2, node(), BigChunk)),
 
-    %% Kill the holder
+    %% Kill the holder and wait for the DOWN deterministically via a
+    %% monitor ref. The space_monitor receives the same signal, so we
+    %% then wait_for the reservation to actually drop.
+    Ref = monitor(process, Pid),
     exit(Pid, kill),
-    timer:sleep(200),
-
-    %% Now it should succeed
-    ?assertEqual(ok, couch_space_monitor:reserve(Tag2, node(), BigChunk)),
+    receive {'DOWN', Ref, process, Pid, _} -> ok
+    after 2000 -> error(process_did_not_exit)
+    end,
+    ok = wait_for(fun() ->
+        case couch_space_monitor:reserve(Tag2, node(), BigChunk) of
+            ok -> true;
+            {error, _} -> false
+        end
+    end, 25, 40),
     couch_space_monitor:release(Tag2).
 
 %% ===================================================================
@@ -325,17 +333,21 @@ t_starvation_exactly_k_succeed() ->
     ?assert(length(Failures) >= 1),
     ?assert(length(Successes) =< 11),
 
-    %% Release and signal every successful reservation's owning pid.
+    %% Monitor every worker pid so we can wait for them deterministically.
+    Monitors = [{P, monitor(process, P)} || {_I, P} <- PidIdxList],
+    %% Release every successful reservation and tell every worker to die.
     [begin
         couch_space_monitor:release(Tag),
         P ! die
     end || {_I, P, Tag, ok} <- Results],
-    %% Signal any remaining (failed) processes by their tracked pid.
     [P ! die || {_I, P} <- PidIdxList,
                 not lists:any(fun({_, P2, _, ok}) -> P2 =:= P;
                                  (_) -> false
                               end, Results)],
-    timer:sleep(100).
+    %% Wait until every monitor has fired a DOWN.
+    [receive {'DOWN', Ref, process, P, _} -> ok
+     after 2000 -> error({worker_did_not_exit, P})
+     end || {P, Ref} <- Monitors].
 
 %% Release in sequence → each release allows the next waiter
 t_cascade_release() ->
@@ -390,15 +402,10 @@ t_crash_clears_reservations() ->
     ok = couch_space_monitor:reserve(Tag, node(), 999999),
     ?assert(couch_space_monitor:total_reserved() >= 999999),
 
-    %% Kill the gen_server — supervisor will restart it
+    %% Kill the gen_server and wait deterministically for restart.
     OldPid = whereis(couch_space_monitor),
-    exit(OldPid, kill),
-    timer:sleep(500),
-
-    %% New process should be running
-    NewPid = whereis(couch_space_monitor),
-    ?assert(NewPid =/= undefined),
-    ?assert(NewPid =/= OldPid),
+    NewPid = kill_and_wait_restart(couch_space_monitor, OldPid),
+    ?assertNotEqual(OldPid, NewPid),
 
     %% Reservations should be gone (clean ETS)
     ?assertEqual(0, couch_space_monitor:total_reserved()).
@@ -406,12 +413,9 @@ t_crash_clears_reservations() ->
 %% After restart, new reservations work normally
 t_restart_accepts_new_reservations() ->
     ok = config:set("space_monitor", "min_free_floor_bytes", "0", false),
-    %% Kill and wait for restart
     OldPid = whereis(couch_space_monitor),
-    exit(OldPid, kill),
-    timer:sleep(500),
+    _NewPid = kill_and_wait_restart(couch_space_monitor, OldPid),
 
-    %% Should work fine after restart
     Tag = {post_restart, make_ref()},
     ?assertEqual(ok, couch_space_monitor:reserve(Tag, node(), 1000)),
     ?assert(couch_space_monitor:total_reserved() >= 1000),
@@ -602,3 +606,32 @@ write_docs(DbName, N, DataSize) ->
     after
         couch_db:close(Db)
     end.
+
+%% Poll Fun until it returns true, up to RetriesLeft attempts,
+%% sleeping IntervalMs between attempts. Crashes on timeout.
+wait_for(_Fun, _IntervalMs, 0) ->
+    error(wait_for_timeout);
+wait_for(Fun, IntervalMs, RetriesLeft) ->
+    case Fun() of
+        true -> ok;
+        false ->
+            timer:sleep(IntervalMs),
+            wait_for(Fun, IntervalMs, RetriesLeft - 1)
+    end.
+
+%% Kill a registered gen_server and wait deterministically for the
+%% supervisor to restart it with a new pid. Returns the new pid.
+kill_and_wait_restart(Name, OldPid) ->
+    Ref = monitor(process, OldPid),
+    exit(OldPid, kill),
+    receive {'DOWN', Ref, process, OldPid, _} -> ok
+    after 2000 -> error({process_did_not_exit, Name})
+    end,
+    ok = wait_for(fun() ->
+        case whereis(Name) of
+            undefined -> false;
+            P when P =/= OldPid -> true;
+            _ -> false
+        end
+    end, 25, 80),
+    whereis(Name).

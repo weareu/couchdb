@@ -213,11 +213,13 @@ t_pause_prevents_scanning(_) ->
         ok = mem3_auto_shard:pause(),
         Status = mem3_auto_shard:status(),
         ?assertEqual(true, maps:get(paused, Status)),
-        %% Trigger scan — should be a no-op when paused
+        %% Trigger scan. trigger_scan is a cast so we need a sync
+        %% barrier: any gen_server:call after the cast is guaranteed
+        %% to run after the cast has been dequeued and handled.
         ok = mem3_auto_shard:trigger_scan(),
-        timer:sleep(50),
+        _ = sys:get_state(mem3_auto_shard),
         Status2 = mem3_auto_shard:status(),
-        %% scan_count should not increase
+        %% scan_count should not increase when paused
         ?assertEqual(maps:get(scan_count, Status), maps:get(scan_count, Status2))
     end).
 
@@ -238,18 +240,18 @@ t_threshold_change_reflected(_) ->
 
 t_trigger_scan_runs_without_crash(_) ->
     ?_test(begin
-        %% Even when disabled, trigger_scan must not crash the process
+        %% Even when disabled, trigger_scan must not crash the process.
+        %% sys:get_state acts as a sync barrier after the cast.
         ok = mem3_auto_shard:trigger_scan(),
-        timer:sleep(100),
+        _ = sys:get_state(mem3_auto_shard),
         ?assert(is_pid(whereis(mem3_auto_shard)))
     end).
 
 t_disabled_scan_does_nothing(_) ->
     ?_test(begin
-        %% When disabled, scan should not trigger any splits
         ScansBefore = maps:get(scan_count, mem3_auto_shard:status()),
         ok = mem3_auto_shard:trigger_scan(),
-        timer:sleep(100),
+        _ = sys:get_state(mem3_auto_shard),
         ScansAfter = maps:get(scan_count, mem3_auto_shard:status()),
         %% scan_count should NOT increase when disabled
         ?assertEqual(ScansBefore, ScansAfter)
