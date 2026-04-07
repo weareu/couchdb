@@ -242,14 +242,14 @@ start_splits([{ShardName, Size} | Rest], State) ->
             %% Stop trying more splits — cluster is out of space.
             %% No point checking remaining candidates this cycle.
             couch_log:warning(
-                "mem3_auto_shard: stopping scan — insufficient cluster space. "
+                "mem3_auto_shard: stopping scan, insufficient cluster space. "
                 "~B candidates deferred to next cycle.",
                 [length(Rest) + 1]),
             State;
         {error, {below_free_floor, _}} ->
             %% Hard floor hit — stop immediately.
             couch_log:warning(
-                "mem3_auto_shard: stopping scan — node(s) below free space floor. "
+                "mem3_auto_shard: stopping scan, node(s) below free space floor. "
                 "~B candidates deferred to next cycle.",
                 [length(Rest) + 1]),
             State;
@@ -420,30 +420,33 @@ handle_split_done(Pid, Reason, State) ->
 %% Crash recovery — handle interrupted splits from previous run
 %% ===================================================================
 
-%% @doc On startup, scan for interrupted splits and clean up or log.
-%% Same pattern as mem3_reshard:reload_jobs/1 — auto-cleanup targets
-%% from splits that died before shard map update, log those that were
-%% past map update for manual investigation.
+%% @doc Spawn a worker to scan local shards for interrupted splits
+%% and clean them up. find_interrupted_splits/0 opens every local
+%% shard looking for checkpoint _local docs — with 100k shards that
+%% can take minutes, so we must not block the gen_server.
 recover_interrupted_splits(State) ->
-    try
-        Interrupted = mem3_reshard_rep:find_interrupted_splits(),
-        case Interrupted of
-            [] -> ok;
-            _ ->
-                couch_log:notice(
-                    "mem3_auto_shard: found ~B interrupted splits from "
-                    "previous run, recovering...",
-                    [length(Interrupted)]),
-                lists:foreach(fun(Info) ->
-                    mem3_reshard_rep:cleanup_interrupted_split(Info)
-                end, Interrupted)
+    spawn(fun() ->
+        try
+            Interrupted = mem3_reshard_rep:find_interrupted_splits(),
+            case Interrupted of
+                [] -> ok;
+                _ ->
+                    couch_log:notice(
+                        "mem3_auto_shard: found ~B interrupted splits from "
+                        "previous run, recovering...",
+                        [length(Interrupted)]),
+                    lists:foreach(fun(Info) ->
+                        mem3_reshard_rep:cleanup_interrupted_split(Info)
+                    end, Interrupted)
+            end
+        catch
+            _:Err ->
+                couch_log:warning(
+                    "mem3_auto_shard: error during interrupted split "
+                    "recovery: ~p",
+                    [Err])
         end
-    catch
-        _:Err ->
-            couch_log:warning(
-                "mem3_auto_shard: error during interrupted split recovery: ~p",
-                [Err])
-    end,
+    end),
     State.
 
 %% ===================================================================
@@ -761,12 +764,16 @@ subtract_reservations(Caps, Reservations) ->
 
 subtract_from_dirs([], _Reserved) -> [];
 subtract_from_dirs(Dirs, Reserved) ->
-    TotalFree = lists:sum([Free || {_P, _Pct, Free, _T} <- Dirs]),
-    case TotalFree of
-        0 -> Dirs;
-        _ ->
-            [{Path, Pct, max(0, Free - round(Reserved * Free / TotalFree)), Total}
-             || {Path, Pct, Free, Total} <- Dirs]
+    %% Deduct the reservation from the directory with the most free
+    %% space — that's the one that would actually be picked for
+    %% placement anyway. Proportional distribution would introduce
+    %% rounding drift that can spuriously trip the free-space floor.
+    Sorted = lists:reverse(lists:keysort(3, Dirs)),
+    case Sorted of
+        [{Path, Pct, Free, Total} | Rest] ->
+            [{Path, Pct, max(0, Free - Reserved), Total} | Rest];
+        [] ->
+            []
     end.
 
 %% @doc Add space reservations for target nodes.

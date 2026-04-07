@@ -167,7 +167,8 @@ cleanup_test_() ->
                 fun t_cleanup_deletes_orphan_targets/0,
                 fun t_cleanup_preserves_post_map_targets/0,
                 fun t_cleanup_removes_checkpoint/0,
-                fun t_cleanup_handles_missing_targets/0
+                fun t_cleanup_handles_missing_targets/0,
+                fun t_cleanup_updating_map_without_shard_map_entry/0
             ]
         }
     }.
@@ -264,6 +265,36 @@ t_cleanup_handles_missing_targets() ->
         factor => 2
     },
     ?assertEqual(ok, mem3_reshard_rep:cleanup_interrupted_split(Info)).
+
+%% A crash recovered in updating_map state is ambiguous. If the shard
+%% map never got updated, the targets are orphans and must be cleaned
+%% up the same way as pre-map states. Because no _dbs is running in
+%% eunit, targets_in_shard_map/2 returns false, so the cleanup path
+%% should delete the targets.
+t_cleanup_updating_map_without_shard_map_entry() ->
+    SourceName = ?tempdb(),
+    TargetName = ?tempdb(),
+    {ok, Src} = couch_db:create(SourceName, [?ADMIN_CTX]),
+    {ok, Tgt} = couch_db:create(TargetName, [?ADMIN_CTX]),
+    couch_db:close(Src),
+    couch_db:close(Tgt),
+    try
+        Info = #{
+            source => SourceName,
+            targets => [TargetName],
+            state => updating_map,
+            factor => 2
+        },
+        ok = mem3_reshard_rep:cleanup_interrupted_split(Info),
+        %% Shard map lookup fails in eunit so we treat as pre-map →
+        %% orphan target should be deleted.
+        ?assertEqual(false, couch_server:exists(TargetName)),
+        %% Source is not touched by cleanup.
+        ?assertEqual(true, couch_server:exists(SourceName))
+    after
+        catch couch_server:delete(SourceName, [?ADMIN_CTX]),
+        catch couch_server:delete(TargetName, [?ADMIN_CTX])
+    end.
 
 %% ===================================================================
 %% 3. Find interrupted splits

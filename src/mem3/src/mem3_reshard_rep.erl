@@ -42,6 +42,10 @@
 -include_lib("couch/include/couch_db.hrl").
 -include_lib("mem3/include/mem3_reshard_rep.hrl").
 
+%% Total number of state transitions a split goes through.
+%% Used for progress reporting via couch_task_status.
+-define(TOTAL_STEPS, 13).
+
 -export([
     split/3,
     subdivide_range/2,
@@ -330,8 +334,7 @@ split(#shard{} = Source, Factor, TargetNodes) when
         [Factor, Source#shard.name]),
     Targets = build_targets(Source, Factor, TargetNodes),
     TMap = build_target_map(Targets),
-    TotalSteps = 13,
-    register_task(Source, Factor, TotalSteps),
+    register_task(Source, Factor, ?TOTAL_STEPS),
     St = #split_state{
         source = Source,
         targets = Targets,
@@ -659,8 +662,7 @@ update_shard_map(Source, Targets, RetriesLeft) ->
                 NewDoc = Doc#doc{body = NewBody},
                 case mem3:update_db_doc(NewDoc) of
                     {ok, _} ->
-                        wait_shard_map_propagated(Source, 60),
-                        ok;
+                        wait_shard_map_propagated(Source, 60);
                     {error, conflict} ->
                         %% Another split updated the same _dbs doc.
                         %% Re-read and retry with jitter.
@@ -678,8 +680,13 @@ update_shard_map(Source, Targets, RetriesLeft) ->
     end.
 
 wait_shard_map_propagated(_Source, 0) ->
-    couch_log:warning("mem3_reshard_rep: shard map propagation timed out", []),
-    ok;  % Continue anyway — map will eventually propagate
+    %% Timed out waiting for the source shard to disappear from the
+    %% local shard map view. Fail the split safely — do NOT proceed
+    %% to source deletion with an unverified propagation. The operator
+    %% can retry; mem3_rep is idempotent.
+    couch_log:error(
+        "mem3_reshard_rep: shard map propagation timed out", []),
+    {error, shard_map_propagation_timeout};
 wait_shard_map_propagated(#shard{name = Name} = Source, RetriesLeft) ->
     timer:sleep(5000),
     DbName = mem3:dbname(Name),
@@ -813,12 +820,12 @@ register_task(Source, Factor, TotalSteps) ->
 %% @doc Update task progress. Step is 1-based, Phase is the state name.
 update_task(Step, Phase) ->
     try
-        Progress = (Step * 100) div 13,
+        Progress = (Step * 100) div ?TOTAL_STEPS,
         couch_task_status:update([
             {phase, Phase},
             {progress, min(Progress, 100)},
             {changes_done, Step},
-            {total_changes, 13}
+            {total_changes, ?TOTAL_STEPS}
         ])
     catch
         _:_ -> ok
@@ -960,44 +967,88 @@ find_interrupted_splits() ->
     end.
 
 %% @doc Clean up orphan target shards from an interrupted split.
-%% Only cleans targets that are NOT in the shard map (pre-map-update state).
+%%
+%% Three cases, mirroring how couch_bt_engine recovers from
+%% .compact.data files on startup:
+%%
+%% 1. Pre-map states: targets exist but the shard map was never
+%%    updated — delete them and rerun the split on the next scan.
+%%
+%% 2. updating_map state: ambiguous. The crash could have happened
+%%    before or after the _dbs write. Check the actual shard map: if
+%%    the targets ARE in the map now, treat this as post-map (preserve
+%%    targets). If they are NOT, treat as pre-map (clean up).
+%%
+%% 3. Post-map states: targets may already be serving traffic.
+%%    Preserve them and alert the operator.
 -spec cleanup_interrupted_split(map()) -> ok.
 cleanup_interrupted_split(#{source := SourceName, targets := TargetNames,
                             state := SplitState}) ->
-    %% States before shard map update — safe to clean up targets
     PreMapStates = [creating_targets, replicating, topoff_1, building_indices,
                     topoff_2, copying_local, topoff_3],
-    case lists:member(SplitState, PreMapStates) of
-        true ->
-            couch_log:notice(
-                "mem3_reshard_rep: cleaning up ~B orphan targets from "
-                "interrupted split of ~s (was in state ~s)",
-                [length(TargetNames), SourceName, SplitState]),
-            lists:foreach(fun(TargetName) ->
-                try
-                    case couch_server:exists(TargetName) of
-                        true ->
-                            couch_log:notice(
-                                "mem3_reshard_rep: deleting orphan target ~s",
-                                [TargetName]),
-                            couch_server:delete(TargetName, [?ADMIN_CTX]);
-                        false ->
-                            ok
-                    end
-                catch
-                    _:_ -> ok
-                end
-            end, TargetNames),
-            %% Remove the checkpoint
-            delete_checkpoint(SourceName),
-            ok;
-        false ->
-            %% Post-map-update: targets may be live and serving traffic.
-            %% DO NOT delete. Log for operator investigation.
+    IsPreMap = lists:member(SplitState, PreMapStates),
+    IsUpdatingMap = SplitState =:= updating_map,
+    case {IsPreMap, IsUpdatingMap} of
+        {true, _} ->
+            do_cleanup_orphan_targets(SourceName, TargetNames, SplitState);
+        {_, true} ->
+            case targets_in_shard_map(SourceName, TargetNames) of
+                true ->
+                    couch_log:warning(
+                        "mem3_reshard_rep: interrupted split of ~s was in "
+                        "updating_map and shard map now contains targets. "
+                        "Targets left in place, manual verification "
+                        "required.", [SourceName]),
+                    ok;
+                false ->
+                    couch_log:notice(
+                        "mem3_reshard_rep: interrupted split of ~s was in "
+                        "updating_map but shard map does NOT contain "
+                        "targets, cleaning up as pre-map.", [SourceName]),
+                    do_cleanup_orphan_targets(
+                        SourceName, TargetNames, SplitState)
+            end;
+        _ ->
             couch_log:warning(
                 "mem3_reshard_rep: interrupted split of ~s was past "
                 "shard map update (state: ~s). Targets left in place. "
                 "Manual verification required.",
                 [SourceName, SplitState]),
             ok
+    end.
+
+do_cleanup_orphan_targets(SourceName, TargetNames, SplitState) ->
+    couch_log:notice(
+        "mem3_reshard_rep: cleaning up ~B orphan targets from "
+        "interrupted split of ~s (was in state ~s)",
+        [length(TargetNames), SourceName, SplitState]),
+    lists:foreach(fun(TargetName) ->
+        try
+            case couch_server:exists(TargetName) of
+                true ->
+                    couch_log:notice(
+                        "mem3_reshard_rep: deleting orphan target ~s",
+                        [TargetName]),
+                    couch_server:delete(TargetName, [?ADMIN_CTX]);
+                false ->
+                    ok
+            end
+        catch
+            _:_ -> ok
+        end
+    end, TargetNames),
+    delete_checkpoint(SourceName),
+    ok.
+
+%% @doc Check whether the cluster shard map for the source's logical
+%% database contains the given target shard names. Used to disambiguate
+%% an interrupted split in updating_map state.
+targets_in_shard_map(SourceName, TargetNames) ->
+    try
+        DbName = mem3:dbname(SourceName),
+        Shards = mem3:shards(DbName),
+        ShardNamesInMap = [S#shard.name || S <- Shards],
+        lists:all(fun(T) -> lists:member(T, ShardNamesInMap) end, TargetNames)
+    catch
+        _:_ -> false
     end.

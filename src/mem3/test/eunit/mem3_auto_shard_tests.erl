@@ -520,3 +520,62 @@ t_multi_range_same_node_accumulates() ->
         Total = maps:fold(fun(_, B, Acc) -> B + Acc end, 0, PerNodeReservations),
         ?assertEqual(3 * PerTarget, Total)
     end).
+
+%% Multi-dir node: subtract_reservations must pull ALL the bytes
+%% from the LARGEST dir (the one that would be picked for placement),
+%% not proportionally distribute across every dir. Proportional
+%% rounding can spuriously trip the free-space floor.
+multi_dir_subtract_test_() ->
+    {
+        "subtract_from_dirs behavior on multi-dir nodes",
+        [
+            fun t_subtract_from_largest_dir/0,
+            fun t_subtract_exceeds_largest_dir_clamps_to_zero/0,
+            fun t_subtract_on_empty_dirs/0
+        ]
+    }.
+
+t_subtract_from_largest_dir() ->
+    ?_test(begin
+        %% node with /data1=60GB free, /data2=40GB free
+        Caps = #{
+            node() => #{dirs => [
+                {"/data1", 40, 60000000000, 100000000000},
+                {"/data2", 60, 40000000000, 100000000000}
+            ]}
+        },
+        Res = #{node() => 20000000000},
+        Adj = mem3_auto_shard:subtract_reservations(Caps, Res),
+        Dirs = maps:get(dirs, maps:get(node(), Adj)),
+        %% Largest dir (data1, 60GB) should lose 20GB → 40GB.
+        %% Smaller dir (data2) untouched at 40GB.
+        %% Sort result by path to make assertions stable.
+        Sorted = lists:keysort(1, Dirs),
+        [{"/data1", _, Data1Free, _},
+         {"/data2", _, Data2Free, _}] = Sorted,
+        ?assertEqual(40000000000, Data1Free),
+        ?assertEqual(40000000000, Data2Free)
+    end).
+
+t_subtract_exceeds_largest_dir_clamps_to_zero() ->
+    ?_test(begin
+        %% Only 50GB free on the largest dir but reservation is 60GB.
+        Caps = #{
+            node() => #{dirs => [
+                {"/data1", 50, 50000000000, 100000000000}
+            ]}
+        },
+        Res = #{node() => 60000000000},
+        Adj = mem3_auto_shard:subtract_reservations(Caps, Res),
+        [{"/data1", _, Free, _}] =
+            maps:get(dirs, maps:get(node(), Adj)),
+        ?assertEqual(0, Free)
+    end).
+
+t_subtract_on_empty_dirs() ->
+    ?_test(begin
+        Caps = #{node() => #{dirs => []}},
+        Res = #{node() => 1000000000},
+        Adj = mem3_auto_shard:subtract_reservations(Caps, Res),
+        ?assertEqual([], maps:get(dirs, maps:get(node(), Adj)))
+    end).
