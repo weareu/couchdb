@@ -14,11 +14,20 @@ fi
 
 echo "Installing auto-shard Fauxton addon..."
 
-# Copy addon
+# Copy top-level addon files
 mkdir -p "$FAUXTON_DIR/app/addons/autoshard"
 cp "$SCRIPT_DIR/autoshard/"*.js "$FAUXTON_DIR/app/addons/autoshard/"
-mkdir -p "$FAUXTON_DIR/app/addons/autoshard/__tests__"
+
+# Copy components subdirectory (controller + status/controls/tasks/reservations panels)
+mkdir -p "$FAUXTON_DIR/app/addons/autoshard/components"
+cp "$SCRIPT_DIR/autoshard/components/"*.js "$FAUXTON_DIR/app/addons/autoshard/components/"
+
+# Copy SCSS asset
 mkdir -p "$FAUXTON_DIR/app/addons/autoshard/assets/scss"
+cp "$SCRIPT_DIR/autoshard/assets/scss/"*.scss "$FAUXTON_DIR/app/addons/autoshard/assets/scss/"
+
+# Empty tests dir for consistency with other addons
+mkdir -p "$FAUXTON_DIR/app/addons/autoshard/__tests__"
 
 # Update load_addons.js to include our addon
 cp "$SCRIPT_DIR/load_addons.js" "$FAUXTON_DIR/app/load_addons.js"

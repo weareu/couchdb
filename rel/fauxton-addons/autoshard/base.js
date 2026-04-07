@@ -12,12 +12,13 @@
 
 import FauxtonAPI from "../../core/api";
 import AutoShard from "./routes";
+import "./assets/scss/autoshard.scss";
 import reducers from './reducers';
 
 AutoShard.initialize = function () {
   FauxtonAPI.addHeaderLink({
     title: 'Auto-Shard',
-    icon: 'fonticon-replicate',
+    icon: 'fonticon-database',
     href: '#/autoshard'
   });
 };
