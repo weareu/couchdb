@@ -78,7 +78,10 @@
     cooldown_ms :: pos_integer(),
     maintenance_window :: always | {non_neg_integer(), non_neg_integer()},
     paused :: boolean(),
-    exclude_patterns :: [binary()],
+    %% List of {OriginalPattern, CompiledRegex} pairs. Patterns are
+    %% compiled once at load_config time so scanning 10k candidates
+    %% does not re-compile every pattern per candidate.
+    exclude_patterns :: [{binary(), term()}],
     protected_dbs :: [binary()],
     %% Key = ShardName, Value = {Pid, PerNodeReservations}
     %% PerNodeReservations is a map of node() => bytes, recording the
@@ -157,7 +160,8 @@ handle_call(status, _From, State) ->
         splits_triggered => State#state.splits_triggered,
         is_coordinator => is_coordinator(),
         maintenance_window => State#state.maintenance_window,
-        exclude_patterns => State#state.exclude_patterns
+        exclude_patterns =>
+            [original_pattern(P) || P <- State#state.exclude_patterns]
     },
     {reply, Reply, State};
 handle_call(pause, _From, State) ->
@@ -505,8 +509,20 @@ in_maintenance_window({StartHour, EndHour}) ->
 
 -spec is_excluded(binary(), #state{}) -> boolean().
 is_excluded(DbName, #state{exclude_patterns = Patterns}) ->
-    lists:any(fun(Pattern) ->
-        glob_match(DbName, Pattern)
+    DbStr = case is_binary(DbName) of
+        true -> binary_to_list(DbName);
+        false -> DbName
+    end,
+    lists:any(fun
+        ({_Orig, Compiled}) ->
+            %% Compiled regex, use it directly
+            case re:run(DbStr, Compiled) of
+                {match, _} -> true;
+                nomatch -> false
+            end;
+        (Pattern) when is_binary(Pattern); is_list(Pattern) ->
+            %% Fallback for callers that hand us raw patterns
+            glob_match(DbName, Pattern)
     end, Patterns).
 
 is_protected(DbName, #state{protected_dbs = Protected}) ->
@@ -633,9 +649,27 @@ load_config(State) ->
         max_split_factor = MaxFactor,
         cooldown_ms = CooldownMs,
         maintenance_window = Window,
-        exclude_patterns = parse_db_list(ExcludeStr),
+        exclude_patterns = compile_patterns(parse_db_list(ExcludeStr)),
         protected_dbs = parse_db_list(ProtectedStr)
     }.
+
+%% Compile each glob pattern into a regex once at load time.
+compile_patterns(Patterns) ->
+    lists:map(fun(P) ->
+        PStr = case is_binary(P) of
+            true -> binary_to_list(P);
+            false -> P
+        end,
+        RegExp = couch_multidir:glob_to_regexp(PStr),
+        case re:compile(RegExp) of
+            {ok, MP} -> {P, MP};
+            _ -> P  % Fall back to un-compiled form
+        end
+    end, Patterns).
+
+%% Extract the original binary pattern from a compiled entry.
+original_pattern({Orig, _Compiled}) -> Orig;
+original_pattern(P) -> P.
 
 parse_maintenance_window("always") -> always;
 parse_maintenance_window(Str) ->

@@ -286,11 +286,65 @@ t_cleanup_updating_map_without_shard_map_entry() ->
             factor => 2
         },
         ok = mem3_reshard_rep:cleanup_interrupted_split(Info),
-        %% Shard map lookup fails in eunit so we treat as pre-map →
+        %% Shard map lookup fails in eunit so we treat as pre-map;
         %% orphan target should be deleted.
         ?assertEqual(false, couch_server:exists(TargetName)),
         %% Source is not touched by cleanup.
         ?assertEqual(true, couch_server:exists(SourceName))
+    after
+        catch couch_server:delete(SourceName, [?ADMIN_CTX]),
+        catch couch_server:delete(TargetName, [?ADMIN_CTX])
+    end.
+
+%% Post-map cleanup must rename the checkpoint rather than leave it in
+%% place. Otherwise every subsequent boot re-detects the same orphan
+%% and spams the log indefinitely. After cleanup find_interrupted_splits
+%% should return empty for this source.
+orphan_rename_test_() ->
+    {
+        "Post-map cleanup renames the checkpoint",
+        {
+            setup,
+            fun test_util:start_couch/0,
+            fun test_util:stop_couch/1,
+            [
+                fun t_post_map_cleanup_stops_re_detection/0
+            ]
+        }
+    }.
+
+t_post_map_cleanup_stops_re_detection() ->
+    SourceName = ?tempdb(),
+    TargetName = ?tempdb(),
+    {ok, Src} = couch_db:create(SourceName, [?ADMIN_CTX]),
+    {ok, Tgt} = couch_db:create(TargetName, [?ADMIN_CTX]),
+    couch_db:close(Src),
+    couch_db:close(Tgt),
+    try
+        %% Write a checkpoint in a post-map state
+        Source = #shard{name = SourceName, range = [0, 16#ffffffff]},
+        Target = #shard{name = TargetName, range = [0, 16#ffffffff]},
+        St = #split_state{
+            source = Source, targets = [Target],
+            target_map = #{}, factor = 2, state = topoff_final
+        },
+        ok = mem3_reshard_rep:checkpoint_state(SourceName, St),
+
+        %% Cleanup should preserve the target and rename the checkpoint
+        Info = #{
+            source => SourceName,
+            targets => [TargetName],
+            state => topoff_final,
+            factor => 2
+        },
+        ok = mem3_reshard_rep:cleanup_interrupted_split(Info),
+        ?assertEqual(true, couch_server:exists(TargetName)),
+
+        %% A second call to find_interrupted_splits on this source
+        %% must NOT return the renamed checkpoint, because
+        %% load_checkpoint only looks under the live _local id.
+        ?assertEqual(not_found,
+            mem3_reshard_rep:load_checkpoint(SourceName))
     after
         catch couch_server:delete(SourceName, [?ADMIN_CTX]),
         catch couch_server:delete(TargetName, [?ADMIN_CTX])

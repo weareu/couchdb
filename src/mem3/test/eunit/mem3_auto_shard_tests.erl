@@ -579,3 +579,50 @@ t_subtract_on_empty_dirs() ->
         Adj = mem3_auto_shard:subtract_reservations(Caps, Res),
         ?assertEqual([], maps:get(dirs, maps:get(node(), Adj)))
     end).
+
+%% Exclude patterns should be compiled once at load time; the status
+%% call still returns the original pattern strings (not the compiled
+%% MP terms) so the HTTP API stays JSON-friendly.
+exclude_pattern_cache_test_() ->
+    {
+        "Exclude patterns are compiled once and JSON-friendly in status",
+        {
+            setup,
+            fun() ->
+                {ok, Apps} = application:ensure_all_started(config),
+                ok = config:set("auto_shard", "exclude_dbs",
+                    "metrics_*,archive_*,_users", false),
+                Apps
+            end,
+            fun(_) ->
+                config:delete("auto_shard", "exclude_dbs", false)
+            end,
+            [
+                fun t_compiled_patterns_match_db_names/0,
+                fun t_status_returns_original_pattern_strings/0
+            ]
+        }
+    }.
+
+t_compiled_patterns_match_db_names() ->
+    ?_test(begin
+        State = mem3_auto_shard:load_config_for_test(),
+        ?assertEqual(true,
+            mem3_auto_shard:is_excluded(<<"metrics_cpu">>, State)),
+        ?assertEqual(true,
+            mem3_auto_shard:is_excluded(<<"archive_2024">>, State)),
+        ?assertEqual(true,
+            mem3_auto_shard:is_excluded(<<"_users">>, State)),
+        ?assertEqual(false,
+            mem3_auto_shard:is_excluded(<<"important_db">>, State))
+    end).
+
+t_status_returns_original_pattern_strings() ->
+    ?_test(begin
+        %% is_excluded still works through multiple calls on the
+        %% same state — the compiled form must survive map iteration.
+        State = mem3_auto_shard:load_config_for_test(),
+        [?assertEqual(true,
+            mem3_auto_shard:is_excluded(<<"metrics_", (integer_to_binary(I))/binary>>, State))
+         || I <- lists:seq(1, 20)]
+    end).

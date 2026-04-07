@@ -204,25 +204,43 @@ verify_doc_counts(SourceName, TargetNames, RetriesLeft) ->
 verify_doc_distribution(SourceName, TargetNames, _HashFun) ->
     {ok, SourceDb} = couch_db:open_int(SourceName, [?ADMIN_CTX]),
     try
-        {ok, SourceInfo} = couch_db:get_db_info(SourceDb),
-        DocCount = couch_util:get_value(doc_count, SourceInfo),
-        case DocCount =< 10000 of
-            true ->
-                %% Small DB: verify ALL docs exist in a target
-                verify_all_docs(SourceDb, TargetNames);
-            false ->
-                %% Large DB: doc counts already verified by verify_doc_counts.
-                %% Do systematic sample: first 500, skip through middle, last 500.
-                verify_systematic_sample(SourceDb, TargetNames, DocCount)
-        end
+        %% Open each target ONCE and reuse the handle for every doc
+        %% lookup. This turns a 6000-DB-open sequence (for a 4-way
+        %% verify-all of a 10k doc DB) into 4 opens plus lookups.
+        with_target_dbs(TargetNames, fun(TargetDbs) ->
+            {ok, SourceInfo} = couch_db:get_db_info(SourceDb),
+            DocCount = couch_util:get_value(doc_count, SourceInfo),
+            case DocCount =< 10000 of
+                true ->
+                    verify_all_docs(SourceDb, TargetDbs);
+                false ->
+                    %% Large DB: doc counts already verified by
+                    %% verify_doc_counts. Systematic sample:
+                    %% first 500, last 500, 500 evenly spaced.
+                    verify_systematic_sample(SourceDb, TargetDbs, DocCount)
+            end
+        end)
     after
         couch_db:close(SourceDb)
     end.
 
-verify_all_docs(SourceDb, TargetNames) ->
+%% Open every target DB once, pass the list of handles into Fun,
+%% close them all in the after block.
+with_target_dbs(TargetNames, Fun) ->
+    TargetDbs = lists:map(fun(TName) ->
+        {ok, Db} = couch_db:open_int(TName, [?ADMIN_CTX]),
+        Db
+    end, TargetNames),
+    try
+        Fun(TargetDbs)
+    after
+        lists:foreach(fun couch_db:close/1, TargetDbs)
+    end.
+
+verify_all_docs(SourceDb, TargetDbs) ->
     {ok, Missing} = couch_db:fold_docs(SourceDb, fun(FDI, AccIn) ->
         #full_doc_info{id = DocId} = FDI,
-        case doc_exists_in_any_target(DocId, TargetNames) of
+        case doc_in_any(DocId, TargetDbs) of
             true -> {ok, AccIn};
             false -> {ok, [DocId | AccIn]}
         end
@@ -233,30 +251,27 @@ verify_all_docs(SourceDb, TargetNames) ->
                       lists:sublist(Missing, 10)}}
     end.
 
-verify_systematic_sample(SourceDb, TargetNames, DocCount) ->
-    %% Check first 500
+verify_systematic_sample(SourceDb, TargetDbs, DocCount) ->
     {ok, Missing1} = couch_db:fold_docs(SourceDb, fun(FDI, AccIn) ->
         #full_doc_info{id = DocId} = FDI,
-        case doc_exists_in_any_target(DocId, TargetNames) of
+        case doc_in_any(DocId, TargetDbs) of
             true -> {ok, AccIn};
             false -> {ok, [DocId | AccIn]}
         end
     end, [], [{limit, 500}]),
-    %% Check last 500 (fold in reverse)
     {ok, Missing2} = couch_db:fold_docs(SourceDb, fun(FDI, AccIn) ->
         #full_doc_info{id = DocId} = FDI,
-        case doc_exists_in_any_target(DocId, TargetNames) of
+        case doc_in_any(DocId, TargetDbs) of
             true -> {ok, AccIn};
             false -> {ok, [DocId | AccIn]}
         end
     end, [], [{limit, 500}, {dir, rev}]),
-    %% Check 500 evenly spaced through the middle
     Step = max(1, DocCount div 500),
     {ok, {Missing3, _}} = couch_db:fold_docs(SourceDb, fun(FDI, {AccIn, Counter}) ->
         case Counter rem Step of
             0 ->
                 #full_doc_info{id = DocId} = FDI,
-                case doc_exists_in_any_target(DocId, TargetNames) of
+                case doc_in_any(DocId, TargetDbs) of
                     true -> {ok, {AccIn, Counter + 1}};
                     false -> {ok, {[DocId | AccIn], Counter + 1}}
                 end;
@@ -271,18 +286,14 @@ verify_systematic_sample(SourceDb, TargetNames, DocCount) ->
                       lists:sublist(AllMissing, 10)}}
     end.
 
-doc_exists_in_any_target(DocId, TargetNames) ->
-    lists:any(fun(TName) ->
-        {ok, TDb} = couch_db:open_int(TName, [?ADMIN_CTX]),
-        try
-            case couch_db:open_doc(TDb, DocId, []) of
-                {ok, _Doc} -> true;
-                {not_found, _} -> false
-            end
-        after
-            couch_db:close(TDb)
+%% Does DocId exist in ANY of the pre-opened target DB handles?
+doc_in_any(DocId, TargetDbs) ->
+    lists:any(fun(TDb) ->
+        case couch_db:open_doc(TDb, DocId, []) of
+            {ok, _Doc} -> true;
+            {not_found, _} -> false
         end
-    end, TargetNames).
+    end, TargetDbs).
 
 %% ===================================================================
 %% Pre-flight space check
@@ -546,7 +557,15 @@ create_replication_checkpoints(#shard{name = SourceName}, Targets) ->
                         couch_db:close(TDb)
                     end
                 catch
-                    _:_ -> ok  % Best effort — topoff will still work
+                    %% Best effort. Topoff will still function but
+                    %% mem3_sync will re-replicate the shard from
+                    %% other cluster nodes without this checkpoint,
+                    %% so log the failure loudly.
+                    Class:Reason ->
+                        couch_log:warning(
+                            "mem3_reshard_rep: failed to create "
+                            "replication checkpoint ~s -> ~s: ~p:~p",
+                            [SourceName, TName, Class, Reason])
                 end
             end, UniqueTargets)
         after
@@ -999,6 +1018,7 @@ cleanup_interrupted_split(#{source := SourceName, targets := TargetNames,
                         "updating_map and shard map now contains targets. "
                         "Targets left in place, manual verification "
                         "required.", [SourceName]),
+                    orphan_checkpoint(SourceName),
                     ok;
                 false ->
                     couch_log:notice(
@@ -1014,7 +1034,36 @@ cleanup_interrupted_split(#{source := SourceName, targets := TargetNames,
                 "shard map update (state: ~s). Targets left in place. "
                 "Manual verification required.",
                 [SourceName, SplitState]),
+            orphan_checkpoint(SourceName),
             ok
+    end.
+
+%% Rename the checkpoint so subsequent boots do not keep re-detecting
+%% the same orphan and spamming the log. The operator can still find
+%% the doc under _local/auto_split_orphan_<ts>_<source>.
+orphan_checkpoint(SourceName) ->
+    OldId = checkpoint_doc_id(SourceName),
+    TimestampBin = integer_to_binary(erlang:system_time(second)),
+    NewId = <<"_local/auto_split_orphan_", TimestampBin/binary, "_",
+              SourceName/binary>>,
+    try
+        {ok, Db} = couch_db:open_int(SourceName, [?ADMIN_CTX]),
+        try
+            case couch_db:open_doc(Db, OldId, [ejson_body]) of
+                {ok, #doc{body = Body, revs = {_, Revs}}} ->
+                    %% Write the new doc then delete the old one.
+                    {ok, _} = couch_db:update_doc(
+                        Db, #doc{id = NewId, body = Body}, []),
+                    {ok, _} = couch_db:delete_doc(Db, OldId, Revs),
+                    ok;
+                {not_found, _} ->
+                    ok
+            end
+        after
+            couch_db:close(Db)
+        end
+    catch
+        _:_ -> ok
     end.
 
 do_cleanup_orphan_targets(SourceName, TargetNames, SplitState) ->

@@ -315,6 +315,10 @@ apply_auto_config(Props) ->
     end,
     case couch_util:get_value(<<"max_shard_size_bytes">>, Props) of
         Size when is_integer(Size), Size >= 1073741824 ->
+            %% Persist to config so the threshold survives a restart,
+            %% not just the in-memory gen_server state.
+            config:set("auto_shard", "max_shard_size_bytes",
+                integer_to_list(Size), false),
             mem3_auto_shard:set_threshold(Size);
         Size when is_integer(Size) ->
             throw({bad_request, <<"Minimum threshold is 1 GB (1073741824 bytes)">>});
@@ -411,9 +415,28 @@ invalid_range() ->
 reservation_to_json(#{tag := Tag, node := Node, bytes := Bytes,
                       created_at := CreatedAt, description := Desc}) ->
     {[
-        {tag, iolist_to_binary(io_lib:format("~p", [Tag]))},
+        {tag, tag_to_json(Tag)},
         {node, atom_to_binary(Node, utf8)},
         {bytes, Bytes},
         {created_at, CreatedAt},
         {description, Desc}
     ]}.
+
+%% Structured JSON representation of a reservation tag. Callers can
+%% parse the {type, name} pair instead of a pretty-printed Erlang term.
+tag_to_json({auto_split, Name}) when is_binary(Name) ->
+    {[{type, <<"auto_split">>}, {name, Name}]};
+tag_to_json({manual_split, Id}) when is_binary(Id) ->
+    {[{type, <<"manual_split">>}, {id, Id}]};
+tag_to_json({compaction, Name}) when is_binary(Name) ->
+    {[{type, <<"compaction">>}, {name, Name}]};
+tag_to_json({view_compact, Name}) when is_binary(Name) ->
+    {[{type, <<"view_compact">>}, {name, Name}]};
+tag_to_json({manual_compact, Name}) when is_binary(Name) ->
+    {[{type, <<"manual_compact">>}, {name, Name}]};
+tag_to_json({index_build, Name}) when is_binary(Name) ->
+    {[{type, <<"index_build">>}, {name, Name}]};
+tag_to_json(Other) ->
+    %% Fallback for any tag we don't recognize.
+    {[{type, <<"unknown">>},
+      {raw, iolist_to_binary(io_lib:format("~p", [Other]))}]}.
